@@ -1,0 +1,99 @@
+name: ${COMPOSE_PROJECT_NAME}
+
+x-core: &core-environment
+  image: ${NEUROMEM_CORE_IMAGE}
+  env_file: .env
+  environment: &core-settings
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+    NEUROMEM_NODE_ID: ${NODE_ID}
+    NEUROMEM_API_TOKEN: ${API_TOKEN}
+    NEUROMEM_MCP_PUBLIC_URL: http://127.0.0.1:${MCP_PORT}/mcp
+    NEUROMEM_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+    NEUROMEM_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+    NEUROMEM_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding:4b}
+    NEUROMEM_EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-2560}
+    NEUROMEM_GENERATION_BASE_URL: ${GENERATION_BASE_URL:-}
+    NEUROMEM_GENERATION_API_KEY: ${GENERATION_API_KEY:-}
+    NEUROMEM_GENERATION_MODEL: ${GENERATION_MODEL:-}
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  depends_on:
+    database:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  database:
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:0.8.6-pg15}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  core:
+    <<: *core-environment
+    command: ["api"]
+    ports:
+      - "127.0.0.1:${API_PORT}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    <<: *core-environment
+    command: ["worker"]
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  mcp:
+    image: ${NEUROMEM_MCP_IMAGE}
+    environment:
+      PORT: "3001"
+      NEUROMEM_NODE_ID: ${NODE_ID}
+      NEUROMEM_NODE_ALIAS: ${NODE_ALIAS}
+      NEUROMEM_CORE_URL: http://core:8000
+      NEUROMEM_CORE_TOKEN: ${API_TOKEN}
+      NEUROMEM_MCP_TOKEN: ${MCP_TOKEN}
+      NEUROMEM_MCP_STATE_DIR: /var/lib/neuromem-mcp
+    ports:
+      - "127.0.0.1:${MCP_PORT}:3001"
+    volumes:
+      - mcp-state:/var/lib/neuromem-mcp
+    depends_on:
+      core:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    image: ${NEUROMEM_DASHBOARD_IMAGE}
+    environment:
+      PORT: "8080"
+      CORE_API_UPSTREAM: http://core:8000
+      CORE_API_TOKEN: ${API_TOKEN}
+      MANAGER_BASE_URL: http://127.0.0.1:${MANAGER_PORT}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT}:8080"
+    restart: unless-stopped
+
+volumes:
+  database-data:
+    name: ${DB_VOLUME_NAME}
+  mcp-state:
+    name: ${MCP_STATE_VOLUME_NAME}

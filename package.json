@@ -1,0 +1,24 @@
+{
+  "name": "neuromem-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/manager",
+    "apps/mcp",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "package:assets": "node scripts/prepare-manager-package.mjs",
+    "images:build": "node scripts/build-images.mjs",
+    "dev:web": "npm run dev --workspace @neuromem/web",
+    "dev:manager": "npm run build --workspace neuromem && node apps/manager/dist/src/daemon.js"
+  }
+}

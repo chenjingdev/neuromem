@@ -1,0 +1,30 @@
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import test from "node:test";
+import { uuid7 } from "../src/fs-safe.js";
+import { renderMcpConfig } from "../src/mcp-config.js";
+import { NodeManager } from "../src/node-manager.js";
+import { FakeRunner, okFetch, temporaryPaths, threeFreePorts } from "./helpers.js";
+
+test("MCP config reads only the explicitly selected Node secret", async t => {
+  const { home, paths } = await temporaryPaths();
+  t.after(() => fs.rm(home, { recursive: true, force: true }));
+  const manager = new NodeManager({ paths, runner: new FakeRunner(), fetch: okFetch() });
+  const personalId = uuid7();
+  const companyId = uuid7();
+  await manager.createNode({ node_id: personalId, confirmation: personalId, alias: "personal", ports: await threeFreePorts() });
+  await manager.createNode({ node_id: companyId, confirmation: companyId, alias: "company", ports: await threeFreePorts() });
+  const personal = await manager.store.findNode(personalId);
+  const company = await manager.store.findNode(companyId);
+  const personalToken = (await fs.readFile(`${paths.nodes}/${personalId}/.env`, "utf8")).match(/^MCP_TOKEN=(.+)$/m)![1]!;
+  const companyToken = (await fs.readFile(`${paths.nodes}/${companyId}/.env`, "utf8")).match(/^MCP_TOKEN=(.+)$/m)![1]!;
+  const json = await renderMcpConfig(paths, personal, "json");
+  assert.match(json, new RegExp(personalToken));
+  assert.doesNotMatch(json, new RegExp(companyToken));
+  assert.equal(JSON.parse(json).mcpServers.personal.url, `http://127.0.0.1:${personal.ports.mcp}/mcp`);
+  assert.match(JSON.parse(json).skill_path, /assets\/skill\/neuromem-memory\/SKILL\.md$/);
+  const toml = await renderMcpConfig(paths, company, "toml");
+  assert.match(toml, new RegExp(`\[mcp_servers\\.company\]`));
+  assert.match(toml, new RegExp(companyToken));
+  assert.doesNotMatch(toml, new RegExp(personalToken));
+});

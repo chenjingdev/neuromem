@@ -1,0 +1,112 @@
+name: ${COMPOSE_PROJECT_NAME:-neuromem-personal}
+
+services:
+  database:
+    image: pgvector/pgvector:0.8.6-pg15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-neuromem}
+      POSTGRES_USER: ${POSTGRES_USER:-neuromem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-neuromem} -d ${POSTGRES_DB:-neuromem}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - database-data:/var/lib/postgresql/data
+    networks:
+      - node
+
+  core:
+    build:
+      context: ../apps/core
+    restart: unless-stopped
+    environment: &core-environment
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuromem}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB:-neuromem}
+      NEUROMEM_NODE_ID: ${NODE_ID:?NODE_ID is required}
+      NEUROMEM_API_TOKEN: ${API_TOKEN:?API_TOKEN is required}
+      NEUROMEM_EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      NEUROMEM_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      NEUROMEM_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding:4b}
+      NEUROMEM_EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-2560}
+      NEUROMEM_GENERATION_BASE_URL: ${GENERATION_BASE_URL:-}
+      NEUROMEM_GENERATION_API_KEY: ${GENERATION_API_KEY:-}
+      NEUROMEM_GENERATION_MODEL: ${GENERATION_MODEL:-}
+      NEUROMEM_MCP_PUBLIC_URL: http://127.0.0.1:${MCP_PORT:-18765}/mcp
+    command: ["api"]
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:${API_PORT:-18001}:8000"
+    networks:
+      - node
+
+  worker:
+    build:
+      context: ../apps/core
+    restart: unless-stopped
+    environment: *core-environment
+    command: ["worker"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      core:
+        condition: service_healthy
+    networks:
+      - node
+
+  mcp:
+    build:
+      context: ../apps/mcp
+    restart: unless-stopped
+    environment:
+      PORT: 3001
+      NEUROMEM_NODE_ID: ${NODE_ID:?NODE_ID is required}
+      NEUROMEM_NODE_ALIAS: ${NODE_ALIAS:-personal}
+      NEUROMEM_CORE_URL: http://core:8000
+      NEUROMEM_CORE_TOKEN: ${API_TOKEN:?API_TOKEN is required}
+      NEUROMEM_MCP_TOKEN: ${MCP_TOKEN:?MCP_TOKEN is required}
+    depends_on:
+      core:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${MCP_PORT:-18765}:3001"
+    volumes:
+      - mcp-state:/var/lib/neuromem-mcp
+    networks:
+      - node
+
+  web:
+    build:
+      context: ../apps/web
+    environment:
+      CORE_API_UPSTREAM: http://core:8000
+      CORE_API_TOKEN: ${API_TOKEN:?API_TOKEN is required}
+    restart: unless-stopped
+    depends_on:
+      core:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-14173}:8080"
+    networks:
+      - node
+
+volumes:
+  database-data:
+    name: ${DB_VOLUME_NAME:?DB_VOLUME_NAME is required}
+  mcp-state:
+    name: ${MCP_STATE_VOLUME_NAME:?MCP_STATE_VOLUME_NAME is required}
+
+networks:
+  node:
+    internal: false

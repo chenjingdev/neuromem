@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neuromem Admin</title>
+    <style>
+      :root { font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #18181b; background: #fafafa; }
+      body { margin: 0; } header, main { max-width: 960px; margin: auto; padding: 24px; }
+      header { border-bottom: 1px solid #d4d4d8; } h1 { margin: 0; font-size: 20px; }
+      .node { background: white; border: 1px solid #d4d4d8; border-radius: 10px; padding: 18px; margin: 18px 0; }
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .phase { color: #047857; } button { font: inherit; padding: 7px 11px; border: 1px solid #a1a1aa; background: white; border-radius: 6px; cursor: pointer; }
+      button:hover { background: #f4f4f5; } button:disabled { opacity: .5; cursor: wait; }
+      pre { max-height: 320px; overflow: auto; white-space: pre-wrap; background: #18181b; color: #e4e4e7; padding: 14px; border-radius: 7px; }
+      .error { color: #b91c1c; } .muted { color: #71717a; }
+    </style>
+  </head>
+  <body>
+    <header><h1>Neuromem Admin</h1></header>
+    <main><p id="status" class="muted">로컬 관리 서비스에 연결하는 중…</p><div id="nodes"></div></main>
+    <script type="module" src="./admin.js"></script>
+  </body>
+</html>
