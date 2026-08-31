@@ -21,8 +21,14 @@ from sqlalchemy.orm import Session
 
 from . import __version__
 from .config import Settings, get_settings
+from .core_client import (
+    MemoryCoreClient,
+    MemoryCoreError,
+    get_optional_memory_core_client,
+)
 from .db import db_session, get_engine
 from .ids import uuid7
+from .memory_gateway import router as memory_router
 from .models import (
     AgentPeerOwnership,
     AuditEvent,
@@ -138,10 +144,10 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Neuromem Control Plane API",
     version=__version__,
-    summary="Additive sovereign workspace, identity, federation, and Wiki layer",
+    summary="Sovereign workspace, identity, federation, and Wiki control plane",
     description=(
-        "An Apache-2.0 team control plane that runs alongside the existing Honcho "
-        "API, tokens, Web UI, and MCP surface. Hybrid mode is the default."
+        "The Apache-2.0 product boundary for native Workspace and Project "
+        "authorization in front of the AGPL memory core."
     ),
     lifespan=lifespan,
 )
@@ -163,9 +169,25 @@ async def integrity_error_handler(_: Request, _error: IntegrityError) -> JSONRes
     )
 
 
+@app.exception_handler(MemoryCoreError)
+async def memory_core_error_handler(_: Request, error: MemoryCoreError) -> JSONResponse:
+    outward_status = error.status_code
+    if outward_status in {401, 403}:
+        outward_status = status.HTTP_502_BAD_GATEWAY
+    return JSONResponse(
+        status_code=outward_status,
+        content={
+            "detail": "Memory Core request failed",
+            "code": error.code,
+            "retryable": error.retryable,
+            "upstream": error.detail,
+        },
+    )
+
+
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
-    return {"status": "ok", "version": __version__, "mode": "hybrid"}
+    return {"status": "ok", "version": __version__, "mode": "team"}
 
 
 def _cookie(response: Response, token: str, settings: Settings) -> None:
@@ -349,7 +371,9 @@ def post_internal_context_token(
     if not requested <= set(auth.context.capabilities):
         raise HTTPException(status_code=403, detail="capability escalation denied")
     narrowed = auth.context.model_copy(update={"capabilities": sorted(requested)})
-    token, expires_at = InternalTokenSigner(settings.secret_key).mint(narrowed)
+    token, expires_at = InternalTokenSigner(
+        settings.resolved_internal_signing_key
+    ).mint(narrowed)
     return InternalContextTokenResponse(
         token=token, expires_at=expires_at, context=narrowed
     )
@@ -1199,16 +1223,130 @@ def post_complete_transfer(
     body: TransferComplete,
     db: Database,
     auth: CurrentAuth,
+    core: Annotated[MemoryCoreClient | None, Depends(get_optional_memory_core_client)],
 ) -> TransferView:
     transfer = db.get(TransferRequest, transfer_id)
     if transfer is None:
         raise HTTPException(status_code=404, detail="transfer request not found")
+    if body.imported_message_id:
+        # Kept for compatibility with an already-running trusted import worker.
+        imported_message_id = body.imported_message_id
+    else:
+        if core is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Memory Core is required to complete this transfer",
+            )
+        if transfer.status != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail="both approvals are required before import",
+            )
+        if auth.context.workspace_id != transfer.target_workspace_id:
+            raise HTTPException(
+                status_code=403,
+                detail="target workspace must complete the import",
+            )
+        require_admin_membership(db, auth.principal.id, transfer.target_workspace_id)
+        system_peer = db.scalar(
+            select(Peer).where(
+                Peer.workspace_id == transfer.target_workspace_id,
+                Peer.external_key == "system:workspace-transfer",
+            )
+        )
+        if system_peer is None:
+            system_peer = Peer(
+                workspace_id=transfer.target_workspace_id,
+                external_key="system:workspace-transfer",
+                name="Workspace Transfer",
+                kind="system",
+            )
+            db.add(system_peer)
+            db.flush()
+        target_context = auth.context.model_copy(
+            update={"project_id": transfer.target_project_id}
+        )
+        core.request(
+            method="POST",
+            path=f"/v3/workspaces/{transfer.target_workspace_id}/peers",
+            context=target_context,
+            payload={
+                "id": system_peer.id,
+                "metadata": {"system": True, "purpose": "workspace-transfer"},
+            },
+            idempotency_key=f"transfer-peer:{system_peer.id}",
+        )
+        session_id = body.session_id or f"transfer-{transfer.id}"
+        core.request(
+            method="POST",
+            path=f"/v3/workspaces/{transfer.target_workspace_id}/sessions",
+            context=target_context,
+            params={"project_id": transfer.target_project_id},
+            payload={
+                "id": session_id,
+                "project_id": transfer.target_project_id,
+                "metadata": {"transfer_request_id": transfer.id},
+                "peers": {system_peer.id: {}},
+            },
+            idempotency_key=f"transfer-session:{transfer.id}",
+        )
+        result = core.request(
+            method="POST",
+            path=(
+                f"/v3/workspaces/{transfer.target_workspace_id}/sessions/"
+                f"{session_id}/messages"
+            ),
+            context=target_context,
+            params={"project_id": transfer.target_project_id},
+            payload={
+                "project_id": transfer.target_project_id,
+                "messages": [
+                    {
+                        "peer_id": system_peer.id,
+                        "content": transfer.reviewed_content
+                        or transfer.source_snapshot,
+                        "metadata": {
+                            "transfer_request_id": transfer.id,
+                            "source_workspace_id": transfer.source_workspace_id,
+                            "source_project_id": transfer.source_project_id,
+                            "source_record_id": transfer.source_record_id,
+                            "source_content_hash": transfer.source_content_hash,
+                            "source_approved_by": (
+                                transfer.source_approved_by_principal_id
+                            ),
+                            "target_approved_by": (
+                                transfer.target_approved_by_principal_id
+                            ),
+                            "provenance": transfer.provenance,
+                        },
+                    }
+                ],
+            },
+            idempotency_key=f"transfer-message:{transfer.id}",
+        )
+        messages = result if isinstance(result, list) else []
+        if (
+            not messages
+            or not isinstance(messages[0], dict)
+            or not messages[0].get("id")
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Memory Core did not return the imported Message ID",
+            )
+        imported_message_id = str(messages[0]["id"])
+        transfer.provenance = {
+            **transfer.provenance,
+            "import_session_id": session_id,
+            "import_system_peer_id": system_peer.id,
+            "imported_message_id": imported_message_id,
+        }
     return TransferView.model_validate(
         complete_transfer(
             db,
             auth,
             transfer,
-            imported_message_id=body.imported_message_id,
+            imported_message_id=imported_message_id,
         )
     )
 
@@ -1230,6 +1368,7 @@ def get_wiki(project_id: str, db: Database, auth: CurrentAuth) -> WikiView:
     require_capability(auth, "wiki.read")
     project = _project(db, workspace_id, project_id)
     pages: list[WikiPageView] = []
+    sections: list[dict[str, object]] = []
     for page in db.scalars(
         select(WikiPage)
         .where(WikiPage.project_id == project.id)
@@ -1252,7 +1391,23 @@ def get_wiki(project_id: str, db: Database, auth: CurrentAuth) -> WikiView:
                 latest_revision=_revision_view(db, latest) if latest else None,
             )
         )
-    return WikiView(wiki_id=project.wiki_id, project_id=project.id, pages=pages)
+        if latest:
+            sections.append(
+                {
+                    "id": page.id,
+                    "slug": page.slug,
+                    "title": page.title,
+                    "content": latest.content,
+                    "revision_id": latest.id,
+                    "pinned": page.pinned,
+                }
+            )
+    return WikiView(
+        wiki_id=project.wiki_id,
+        project_id=project.id,
+        pages=pages,
+        sections=sections,
+    )
 
 
 @api.post(
@@ -1361,3 +1516,4 @@ def get_audit_events(
 
 
 app.include_router(api)
+app.include_router(memory_router)

@@ -113,6 +113,7 @@ def test_last_owner_cannot_be_demoted(client, bootstrapped):
 def test_agent_credential_is_bound_server_side(client, bootstrapped):
     token = bootstrapped["recovery_credential"]["token"]
     workspace_id = bootstrapped["workspace"]["id"]
+    project_id = bootstrapped["general_project"]["id"]
     headers = auth_headers(token, workspace_id)
     created = client.post(
         f"/api/v1/workspaces/{workspace_id}/agent-peers",
@@ -129,6 +130,7 @@ def test_agent_credential_is_bound_server_side(client, bootstrapped):
             "kind": "mcp",
             "agent_peer_id": peer_id,
             "capabilities": ["project.read", "project.write"],
+            "project_ids": [project_id],
         },
     )
     assert credential.status_code == 200, credential.text
@@ -136,6 +138,7 @@ def test_agent_credential_is_bound_server_side(client, bootstrapped):
     context = client.get("/api/v1/me", headers=auth_headers(agent_token, workspace_id))
     assert context.status_code == 200
     assert context.json()["context"]["agent_peer_id"] == peer_id
+    assert context.json()["context"]["project_id"] == project_id
     assert (
         context.json()["context"]["human_peer_id"] == bootstrapped["human_peer"]["id"]
     )

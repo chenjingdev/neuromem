@@ -5,6 +5,5 @@ COPY pyproject.toml README.md ./
 COPY neuromem_control ./neuromem_control
 RUN pip install --no-cache-dir .
 
-EXPOSE 8090
+EXPOSE 8000
 CMD ["neuromem-control"]
-

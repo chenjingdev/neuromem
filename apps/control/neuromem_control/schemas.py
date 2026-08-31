@@ -3,7 +3,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    model_validator,
+)
 
 Role = Literal["owner", "admin", "contributor", "viewer"]
 WorkspaceKind = Literal["personal", "company"]
@@ -308,7 +315,18 @@ class TransferReject(BaseModel):
 
 
 class TransferComplete(BaseModel):
-    imported_message_id: str = Field(min_length=1, max_length=128)
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    imported_message_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Deprecated worker callback result; omit for gateway import",
+    )
 
 
 class TransferView(APIModel):
@@ -392,6 +410,7 @@ class WikiView(BaseModel):
     wiki_id: str
     project_id: str
     pages: list[WikiPageView]
+    sections: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AuditEventView(APIModel):
@@ -417,3 +436,123 @@ class InternalContextTokenResponse(BaseModel):
     token: str
     expires_at: dt.datetime
     context: AuthContext
+
+
+class MemoryProjectEnsure(BaseModel):
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemorySessionCreate(BaseModel):
+    session_id: str = Field(
+        validation_alias=AliasChoices("session_id", "id"),
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    name: str = Field(default="Agent session", min_length=1, max_length=512)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryRecordCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=128)
+    author_key: str = Field(min_length=1, max_length=128)
+    author_name: str = Field(min_length=1, max_length=256)
+    author_kind: Literal["human", "agent", "automation", "service"]
+    kind: str = "message"
+    content: str
+    source_app: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    occurred_at: dt.datetime | None = None
+
+
+class MemoryRecordBatch(BaseModel):
+    workspace_id: str
+    project_id: str
+    session_id: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_-]+$")
+    records: list[MemoryRecordCreate] = Field(min_length=1, max_length=100)
+
+
+class MemorySearchRequest(BaseModel):
+    workspace_id: str
+    project_id: str
+    query: str = Field(min_length=1)
+    include: list[Literal["records", "claims"]] = Field(
+        default_factory=lambda: ["records", "claims"]
+    )
+    limit: int = Field(default=10, ge=1, le=100)
+    include_general: bool = True
+    include_federated: bool = False
+    session_id: str | None = None
+    after: dt.datetime | None = None
+    before: dt.datetime | None = None
+
+
+class ConclusionQuery(BaseModel):
+    query: str | None = None
+    observer_peer_id: str | None = None
+    observed_peer_id: str | None = None
+    limit: int = Field(default=25, ge=1, le=100)
+    filters: dict[str, Any] = Field(default_factory=dict)
+    include_general: bool = True
+
+
+class MemoryChatRequest(BaseModel):
+    workspace_id: str
+    project_id: str
+    query: str = Field(min_length=1)
+    reasoning_level: Literal["minimal", "low", "medium", "high"] = "low"
+    observer_peer_id: str | None = None
+    target_peer_id: str | None = None
+    session_id: str | None = None
+    include_general: bool = True
+    include_federated: bool = False
+
+
+class MemoryDreamRequest(BaseModel):
+    workspace_id: str
+    project_id: str
+    observer_peer_id: str | None = None
+    observed_peer_id: str | None = None
+    session_id: str | None = None
+    strategy: str = "omni"
+    force: bool = False
+
+
+class DynamicContextRequest(BaseModel):
+    workspace_id: str
+    project_id: str
+    query: str = Field(min_length=1)
+    token_budget: int = Field(default=4000, ge=256, le=128000)
+    peer_id: str | None = None
+    observer_peer_id: str | None = None
+    include_general: bool = True
+    include_federated: bool = False
+    source_limit: int = Field(default=10, ge=1, le=100)
+
+
+class DynamicContextSection(BaseModel):
+    layer: Literal[
+        "general_wiki",
+        "project_wiki",
+        "representation",
+        "source",
+        "federated_source",
+    ]
+    content: str
+    source_ids: list[str] = Field(default_factory=list)
+    estimated_tokens: int
+    truncated: bool = False
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+
+class DynamicContextResponse(BaseModel):
+    workspace_id: str
+    project_id: str
+    query: str
+    token_budget: int
+    estimated_tokens: int
+    sections: list[DynamicContextSection]
+    context: str
+    federated_persisted: Literal[False] = False

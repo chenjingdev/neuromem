@@ -173,6 +173,15 @@ def _context_for(
         credential.workspace_id if credential else None
     )
     selected_project = project_id
+    if (
+        selected_project is None
+        and credential is not None
+        and len(credential.project_ids) == 1
+    ):
+        # Team MCP credentials are normally bound to one Project. Selecting it
+        # server-side keeps workspace/project identity out of untrusted tool
+        # arguments while multi-Project credentials must still choose explicitly.
+        selected_project = credential.project_ids[0]
     human_peer_id: str | None = None
     agent_peer_id: str | None = credential.agent_peer_id if credential else None
     capabilities: set[str] = {"workspace.create"}
@@ -327,7 +336,11 @@ def authenticate_request(
 
     if principal is None or principal.status != "active":
         raise _unauthorized()
-    routed_project = project_header or request.path_params.get("project_id")
+    routed_project = (
+        project_header
+        or request.path_params.get("project_id")
+        or request.query_params.get("project_id")
+    )
     routed_workspace = (
         workspace_header
         or request.path_params.get("workspace_id")
@@ -379,10 +392,12 @@ class InternalTokenSigner:
     ) -> tuple[str, dt.datetime]:
         now = utcnow()
         expires_at = now + dt.timedelta(seconds=ttl_seconds)
+        now_epoch = int(now.replace(tzinfo=dt.UTC).timestamp())
+        expires_epoch = int(expires_at.replace(tzinfo=dt.UTC).timestamp())
         payload = {
             "v": 1,
-            "iat": int(now.timestamp()),
-            "exp": int(expires_at.timestamp()),
+            "iat": now_epoch,
+            "exp": expires_epoch,
             "context": context.model_dump(mode="json"),
         }
         encoded = _b64(
@@ -405,7 +420,8 @@ class InternalTokenSigner:
                 raise ValueError
             payload = json.loads(_unb64(encoded))
             instant = now or utcnow()
-            if payload.get("v") != 1 or int(payload["exp"]) <= int(instant.timestamp()):
+            instant_epoch = int(instant.replace(tzinfo=dt.UTC).timestamp())
+            if payload.get("v") != 1 or int(payload["exp"]) <= instant_epoch:
                 raise ValueError
             return AuthContext.model_validate(payload["context"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:

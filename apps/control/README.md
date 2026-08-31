@@ -34,6 +34,39 @@ The Control Plane mints 60-second HMAC-signed internal context tokens at
 `POST /api/v1/internal-context-tokens`. A Memory Core adapter verifies that token
 instead of trusting client-supplied Workspace, Project, or Peer identifiers.
 
+Configure the bounded gateway with `NEUROMEM_CONTROL_MEMORY_CORE_URL`. Every Core
+request carries `Authorization: Internal nmic1.<payload>.<signature>`; clients never
+receive the Core address or signing key.
+
+## Memory Gateway
+
+The team-native gateway is available under `/api/v1/memory`; compatibility aliases
+used by Neuromem MCP are also exposed:
+
+| Team route | Core v3.1 route |
+| --- | --- |
+| `POST /memory/projects/{id}:ensure` | `POST /v3/workspaces/{w}/projects` |
+| `POST /memory/sessions` | `POST /v3/workspaces/{w}/sessions?project_id=...` |
+| `POST /records:batch` | `POST /v3/workspaces/{w}/sessions/{s}/messages?project_id=...` |
+| `POST /recall` | workspace/session search plus conclusion query |
+| `POST /memory/conclusions` | conclusion list/query |
+| `GET /peers/{p}/representation` | project-aware peer representation |
+| `GET /peers/{p}/card` | project-aware peer card |
+| `GET /sessions/{s}/context` | project-aware session context |
+| `POST /chat` | project-aware Dialectic chat |
+| `POST /dreams` | project-aware Dream scheduling |
+| `POST /context` | local Wiki → representation → relevant local/federated sources |
+
+Dynamic Context uses a conservative UTF-8 token estimate and never writes search or
+federated results. A federated search receives a separately signed, read-only source
+scope only after an active link, grant, and assignment are verified.
+
+The current Core contract does not provide a project-safe record-context lookup from
+a record ID alone, direct claim-evidence expansion, or an ontology graph. Therefore
+`/records/{id}/context`, `/claims/{id}/evidence`, and `/projects/{id}/graph` are not
+fabricated by this service. Project-aware representation/card/context/chat/Dream
+require the Neuromem v3.1 Core patch to honor `project_id` and `include_general`.
+
 ## Security invariants
 
 - A Principal is an authentication subject; a Peer is a memory identity.
@@ -47,4 +80,3 @@ instead of trusting client-supplied Workspace, Project, or Peer identifiers.
   explicitly transferred before it can become local Wiki knowledge.
 
 The root repository's Apache License 2.0 applies to this package.
-
