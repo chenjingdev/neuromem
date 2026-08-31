@@ -1,11 +1,10 @@
-import { BookOpen, BrainCircuit, FileSearch, GitFork, Home, Menu, Network, PanelLeftOpen, Search, UsersRound, X } from "lucide-react";
+import { BookOpen, BrainCircuit, Copy, FileSearch, Home, LogOut, Menu, Network, PanelLeftOpen, Search, UsersRound, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { coreApi, exchangeManagerBootstrap } from "./api";
+import { ApiError, authApi, coreApi, exchangeManagerBootstrap, type ProductOnboardingResult } from "./api";
 import { Button, EmptyState, ErrorState, LoadingState } from "./components/common";
 import { useRemote } from "./hooks";
 import { AdminAuthRequired, AdminPage } from "./pages/AdminPage";
 import { ClaimsPage } from "./pages/ClaimsPage";
-import { GraphPage } from "./pages/GraphPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RecallPage } from "./pages/RecallPage";
 import { WikiPage } from "./pages/WikiPage";
@@ -17,7 +16,6 @@ const productRoutes = [
   { path: "/app/recall", label: "기억 찾기", icon: Search },
   { path: "/app/claims", label: "주장", icon: Network },
   { path: "/app/wiki", label: "Wiki", icon: BookOpen },
-  { path: "/app/graph", label: "그래프", icon: GitFork },
   { path: "/app/team", label: "팀 관리", icon: UsersRound },
 ];
 
@@ -57,6 +55,14 @@ export default function App() {
 }
 
 function ProductApp({ path, setPath }: { path: string; setPath: (path: string) => void }) {
+  const auth = useRemote(() => authApi.me(), []);
+  if (auth.loading) return <div className="standalone-state"><LoadingState label="Neuromem 세션을 확인하는 중입니다." /></div>;
+  if (auth.error instanceof ApiError && auth.error.status === 401) return <ProductAuth inviteMode={path === "/app/invite"} onAuthenticated={auth.retry} />;
+  if (auth.error) return <div className="standalone-state"><ErrorState title="Neuromem에 연결하지 못했습니다." error={auth.error} onRetry={auth.retry} /></div>;
+  return <AuthenticatedProductApp path={path} setPath={setPath} onLogout={auth.retry} />;
+}
+
+function AuthenticatedProductApp({ path, setPath, onLogout }: { path: string; setPath: (path: string) => void; onLogout: () => void }) {
   const workspaces = useRemote(() => coreApi.workspaces(), []);
   const [workspaceId, setWorkspaceId] = useState(() => localStorage.getItem("neuromem.workspace") || "");
   const [projectId, setProjectId] = useState(() => localStorage.getItem("neuromem.project") || "");
@@ -89,7 +95,7 @@ function ProductApp({ path, setPath }: { path: string; setPath: (path: string) =
       <div className="sidebar-head"><a className="wordmark" href="/app" onClick={event => { event.preventDefault(); navigate("/app"); }}><span className="brand-mark">N</span><span>Neuromem</span></a><button className="icon-button mobile-only" onClick={() => setMobileNav(false)} aria-label="메뉴 닫기"><X /></button></div>
       {workspace && <div className="scope-controls"><label><span>Workspace</span><select value={workspace.id} onChange={event => chooseWorkspace(event.target.value)}>{workspaces.data?.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label><span>Project</span><select value={project?.id || ""} onChange={event => chooseProject(event.target.value)} disabled={!workspace.projects?.length}>{workspace.projects?.length ? workspace.projects.map(item => <option key={item.id} value={item.id}>{item.name}</option>) : <option value="">프로젝트 없음</option>}</select></label></div>}
       <nav aria-label="기억 메뉴">{productRoutes.map(route => { const Icon = route.icon; return <button key={route.path} className={path === route.path ? "active" : ""} onClick={() => navigate(route.path)}><Icon /><span>{route.label}</span></button>; })}</nav>
-      <div className="sidebar-foot"><BrainCircuit /><div><strong>Memory core</strong><small>기록 · 주장 · 근거</small></div></div>
+      <div className="sidebar-foot"><BrainCircuit /><div><strong>Team memory</strong><small>Control Gateway 연결</small></div><button className="icon-button" aria-label="로그아웃" onClick={async () => { await authApi.logout(); onLogout(); }}><LogOut /></button></div>
     </aside>
     {mobileNav && <button className="sidebar-scrim" aria-label="메뉴 닫기" onClick={() => setMobileNav(false)} />}
     <main className="product-main"><header className="mobile-header"><button className="icon-button" onClick={() => setMobileNav(true)} aria-label="메뉴 열기"><Menu /></button><span className="wordmark"><span className="brand-mark">N</span><span>Neuromem</span></span></header><div className="page-container">
@@ -106,9 +112,57 @@ function ProductRoute({ path, scope, navigate }: { path: string; scope: Scope; n
   if (path === "/app/recall") return <RecallPage scope={scope} />;
   if (path === "/app/claims") return <ClaimsPage scope={scope} />;
   if (path === "/app/wiki") return <WikiPage scope={scope} />;
-  if (path === "/app/graph") return <GraphPage scope={scope} />;
   if (path === "/app/team") return <TeamPage scope={scope} />;
   return <OverviewPage scope={scope} navigate={navigate} />;
+}
+
+type AuthMode = "login" | "bootstrap" | "invite";
+
+function ProductAuth({ inviteMode, onAuthenticated }: { inviteMode: boolean; onAuthenticated: () => void }) {
+  const invitationToken = new URLSearchParams(window.location.search).get("token") || "";
+  const [mode, setMode] = useState<AuthMode>(inviteMode || invitationToken ? "invite" : "login");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [token, setToken] = useState(invitationToken);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [onboarding, setOnboarding] = useState<ProductOnboardingResult | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!invitationToken) return;
+    // The one-time invitation remains only in component memory after first render.
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [invitationToken]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError(null);
+    try {
+      if (mode === "login") { await authApi.login(email.trim(), password); onAuthenticated(); return; }
+      const result = mode === "bootstrap"
+        ? await authApi.bootstrap({ email: email.trim(), display_name: displayName.trim(), password, workspace_name: workspaceName.trim() })
+        : await authApi.acceptInvitation({ token: token.trim(), display_name: displayName.trim(), password });
+      setOnboarding(result);
+    } catch (reason) { setError(reason); }
+    finally { setBusy(false); }
+  };
+
+  if (onboarding) return <main className="auth-shell"><section className="auth-card recovery-card"><span className="brand-mark">N</span><h1>복구 키를 저장하세요</h1><p>이 키는 다시 표시되지 않습니다. 안전한 암호 관리자에 보관한 뒤 계속하세요.</p><code>{onboarding.recovery_credential.token}</code><div className="auth-actions"><Button className="secondary" onClick={async () => { await navigator.clipboard.writeText(onboarding.recovery_credential.token); setCopied(true); }}><Copy size={15} />{copied ? "복사됨" : "복사"}</Button><Button className="primary" onClick={onAuthenticated}>저장했습니다</Button></div></section></main>;
+
+  return <main className="auth-shell"><section className="auth-card"><div className="auth-brand"><span className="brand-mark">N</span><div><strong>Neuromem</strong><small>Workspace memory</small></div></div><h1>{mode === "login" ? "로그인" : mode === "bootstrap" ? "첫 Workspace 만들기" : "팀 초대 수락"}</h1><p>{mode === "login" ? "팀 기억과 프로젝트에 안전하게 접속합니다." : mode === "bootstrap" ? "최초 Owner와 General Project를 함께 생성합니다." : "이 Workspace만의 Human Peer가 자동으로 생성됩니다."}</p>
+    <form className="stack-form auth-form" onSubmit={submit}>
+      {mode !== "invite" && <label>이메일<input type="email" value={email} onChange={event => setEmail(event.target.value)} autoComplete="email" required /></label>}
+      {mode !== "login" && <label>표시 이름<input value={displayName} onChange={event => setDisplayName(event.target.value)} autoComplete="name" required /></label>}
+      {mode === "bootstrap" && <label>Workspace 이름<input value={workspaceName} onChange={event => setWorkspaceName(event.target.value)} placeholder="Neuromem 팀" required /></label>}
+      {mode === "invite" && <label>초대 토큰<input value={token} onChange={event => setToken(event.target.value)} autoComplete="off" required /></label>}
+      <label>비밀번호<input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "login" ? undefined : 12} required /></label>
+      {Boolean(error) && <div className="inline-message error" role="alert">{error instanceof Error ? error.message : "인증하지 못했습니다."}</div>}
+      <Button className="primary" disabled={busy}>{busy ? "처리 중…" : mode === "login" ? "로그인" : mode === "bootstrap" ? "Workspace 생성" : "초대 수락"}</Button>
+    </form>
+    <div className="auth-switches">{mode !== "login" && <button onClick={() => setMode("login")}>기존 계정 로그인</button>}{mode !== "bootstrap" && <button onClick={() => setMode("bootstrap")}>최초 설정</button>}{mode !== "invite" && <button onClick={() => setMode("invite")}>초대 수락</button>}</div>
+  </section></main>;
 }
 
 function CreateWorkspace({ onCreated }: { onCreated: () => void }) {

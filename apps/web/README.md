@@ -13,9 +13,8 @@ npm test
 npm run build
 ```
 
-The browser calls Core through same-origin `/core-api`. The development proxy
-and the production container inject `CORE_API_TOKEN` server-side; secrets are
-never compiled into the JavaScript bundle. Manager access uses the one-time
+The browser calls Control through same-origin `/api` with its HttpOnly product
+session. It never receives a Memory Core token or calls Core directly. Manager access uses the one-time
 fragment produced by `neuromem admin open`, exchanges it for an HttpOnly cookie,
 and removes the fragment immediately.
 

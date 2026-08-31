@@ -28,6 +28,7 @@ import type {
   WorkspaceMember,
   WorkspaceRole,
   WikiDocument,
+  ProjectOption,
   WorkspaceOption,
 } from "./types";
 
@@ -41,7 +42,6 @@ export class ApiError extends Error {
   }
 }
 
-const coreBase = trimBase(import.meta.env.VITE_CORE_API_URL || "/core-api");
 const teamBase = trimBase(import.meta.env.VITE_TEAM_API_URL || "/api");
 let managerBase = trimBase(import.meta.env.VITE_MANAGER_API_URL || "http://127.0.0.1:14174");
 
@@ -71,9 +71,9 @@ async function request<T>(base: string, path: string, init: RequestInit & { mana
     throw new ApiError(error instanceof Error ? error.message : "서버에 연결할 수 없습니다.");
   }
 
-  const payload = await response.json().catch(() => null) as { error?: string; message?: string } | null;
+  const payload = await response.json().catch(() => null) as { error?: string; message?: string; detail?: string } | null;
   if (!response.ok) {
-    throw new ApiError(payload?.error || payload?.message || `요청에 실패했습니다 (${response.status}).`, response.status);
+    throw new ApiError(payload?.error || payload?.message || payload?.detail || `요청에 실패했습니다 (${response.status}).`, response.status);
   }
   return payload as T;
 }
@@ -150,13 +150,15 @@ interface RawTransfer {
 }
 
 interface RawClaim {
-  id: string;
+  id?: string;
+  claim_id?: string;
   content: string;
   status: string;
   derivation_method: string;
   project_id: string;
   occurred_at?: string;
-  created_at: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface RawNode {
@@ -208,42 +210,87 @@ interface RawMigrationPlan {
   blockers: string[];
 }
 
+function productRequest<T>(path: string, init: RequestInit = {}) {
+  return request<T>(teamBase, path, { ...init, credentials: "include" });
+}
+
+function slugify(value: string, fallback = "project") {
+  const normalized = value.normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized.length >= 3 ? normalized.slice(0, 128) : `${fallback}-${Date.now().toString(36)}`;
+}
+
+/** Team product memory APIs. Every call enters through Control; the browser
+ * never talks to Memory Core or carries a Core token. */
 export const coreApi = {
   workspaces: async () => {
-    const payload = await request<{ items?: WorkspaceOption[]; workspaces?: WorkspaceOption[] }>(coreBase, "/v1/workspaces");
-    const workspaces = payload.items || payload.workspaces || [];
+    const payload = await productRequest<{ items?: WorkspaceOption[]; workspaces?: WorkspaceOption[] } | WorkspaceOption[]>("/v1/workspaces");
+    const workspaces = Array.isArray(payload) ? payload : payload.items || payload.workspaces || [];
     return Promise.all(workspaces.map(async workspace => {
-      const projects = await request<{ items?: WorkspaceOption["projects"]; projects?: WorkspaceOption["projects"] }>(
-        coreBase,
+      const projects = await productRequest<{ items?: WorkspaceOption["projects"]; projects?: WorkspaceOption["projects"] } | NonNullable<WorkspaceOption["projects"]>>(
         `/v1/workspaces/${encodeURIComponent(workspace.id)}/projects`,
+        { headers: teamHeaders(workspace.id) },
       );
-      return { ...workspace, projects: projects.items || projects.projects || [] };
+      return { ...workspace, projects: Array.isArray(projects) ? projects : projects.items || projects.projects || [] };
     }));
   },
-  createWorkspace: (name: string) => request<WorkspaceOption>(coreBase, "/v1/workspaces", json({ name })),
-  createProject: (workspaceId: string, name: string) => request<{ id: string; name: string }>(
-    coreBase,
+  createWorkspace: (name: string) => productRequest<WorkspaceOption>("/v1/workspaces", json({ slug: slugify(name, "workspace"), name, kind: "company" })),
+  createProject: (workspaceId: string, name: string) => productRequest<{ id: string; name: string }>(
     `/v1/workspaces/${encodeURIComponent(workspaceId)}/projects`,
-    json({ name }),
+    { ...json({ slug: slugify(name), name, access_policy: "inherited" }), headers: teamHeaders(workspaceId) },
   ),
-  overview: async (scope: Scope) => normalizeOverview(await request<RawOverview>(coreBase, scoped(`/v1/projects/${encodeURIComponent(scope.projectId)}/overview`, scope)), scope),
-  recall: async (scope: Scope, query: string) => normalizeRecall(await request<RawRecall>(coreBase, "/v1/recall", json({
+  overview: async (scope: Scope): Promise<Overview> => {
+    const claims = await coreApi.claims(scope);
+    return {
+      workspace: { id: scope.workspaceId, name: scope.workspaceName || scope.workspaceId },
+      project: { id: scope.projectId, name: scope.projectName || scope.projectId },
+      state: "healthy",
+      counts: { records: 0, claims: claims.items.length },
+      processing: { pending: 0, running: 0, failed: 0 },
+      mcp: { url: productMcpUrl(), state: "healthy" },
+      recent_claims: claims.items.slice(0, 5),
+    };
+  },
+  recall: async (scope: Scope, query: string) => normalizeRecall(await productRequest<RawRecall>("/v1/recall", { ...json({
     workspace_id: scope.workspaceId,
     project_id: scope.projectId,
     query,
-  }))),
+    include: ["records", "claims"],
+    include_general: true,
+    include_federated: false,
+  }), headers: teamHeaders(scope.workspaceId, scope.projectId) })),
   claims: async (scope: Scope) => {
-    const payload = await request<{ items: Array<{ claim: RawClaim; evidence_count: number }> }>(coreBase, scoped(`/v1/projects/${encodeURIComponent(scope.projectId)}/claims`, scope));
-    return { items: payload.items.map(item => normalizeClaim(item.claim)) };
+    const payload = await productRequest<{ items: Array<RawClaim | { claim: RawClaim }> }>("/v1/memory/conclusions", {
+      ...json({ query: null, limit: 100, include_general: true }), headers: teamHeaders(scope.workspaceId, scope.projectId),
+    });
+    return { items: payload.items.map(item => normalizeClaim("claim" in item ? item.claim : item)) };
   },
-  claimEvidence: async (scope: Scope, claimId: string) => normalizeClaimEvidence(await request<RawClaimEvidence>(coreBase, scoped(`/v1/claims/${encodeURIComponent(claimId)}/evidence`, scope))),
-  wiki: async (scope: Scope) => normalizeWiki(await request<RawWiki>(coreBase, scoped(`/v1/projects/${encodeURIComponent(scope.projectId)}/wiki`, scope)), scope),
-  graph: async (scope: Scope) => normalizeGraph(await request<RawGraph>(coreBase, scoped(`/v1/projects/${encodeURIComponent(scope.projectId)}/graph`, scope))),
-  recordContext: async (scope: Scope, recordId: string) => normalizeRecordContext(await request<{ target_record_id: string; records: RawRecord[] }>(coreBase, scoped(`/v1/records/${encodeURIComponent(recordId)}/context`, scope))),
-  retryFailedJobs: (scope: Scope) => request<{ retried: number }>(coreBase, "/v1/jobs:retry-failed", json({
-    workspace_id: scope.workspaceId,
-    project_id: scope.projectId,
+  wiki: async (scope: Scope) => normalizeWiki(await productRequest<RawWiki>(`/v1/projects/${encodeURIComponent(scope.projectId)}/wiki`, {
+    headers: teamHeaders(scope.workspaceId, scope.projectId),
+  }), scope),
+  claimEvidence: async (_scope: Scope, _claimId: string): Promise<ClaimEvidence> => { throw new ApiError("팀 모드에서는 Claim evidence 상세를 아직 제공하지 않습니다.", 501); },
+  graph: async (_scope: Scope): Promise<KnowledgeGraph> => { throw new ApiError("팀 모드에서는 Graph를 아직 제공하지 않습니다.", 501); },
+  recordContext: async (_scope: Scope, _recordId: string): Promise<RecordContext> => { throw new ApiError("팀 모드에서는 record context를 아직 제공하지 않습니다.", 501); },
+};
+
+export interface ProductAuthEnvelope {
+  principal: { id: string; email: string; display_name: string };
+  context: { workspace_id?: string | null; project_id?: string | null; capabilities: string[] };
+}
+
+export interface ProductOnboardingResult extends ProductAuthEnvelope {
+  workspace: WorkspaceOption;
+  general_project: ProjectOption;
+  recovery_credential: { token: string; credential: { token_prefix: string } };
+}
+
+export const authApi = {
+  me: () => productRequest<ProductAuthEnvelope>("/v1/me"),
+  login: (email: string, password: string) => productRequest<ProductAuthEnvelope>("/v1/auth/login", json({ email, password })),
+  bootstrap: (input: { email: string; display_name: string; password: string; workspace_name: string }) => productRequest<ProductOnboardingResult>("/v1/auth/bootstrap", json({
+    ...input, workspace_slug: slugify(input.workspace_name, "workspace"),
   })),
+  acceptInvitation: (input: { token: string; display_name: string; password: string }) => productRequest<ProductOnboardingResult>("/v1/auth/invitations:accept", json(input)),
+  logout: () => productRequest<void>("/v1/auth/logout", json({})),
 };
 
 function normalizePeerBindings(rows: RawPeerBinding[], workspaceId: string): PeerBinding[] {
@@ -328,7 +375,9 @@ export const teamApi = {
     const result = await request<{ invitation: { id: string; expires_at: string }; token: string }>(
       teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/invitations`, { ...json(input), credentials: "include", headers: teamHeaders(workspaceId) },
     );
-    return { invitation_id: result.invitation.id, invite_url: result.token, expires_at: result.invitation.expires_at };
+    const invite = new URL("/app/invite", window.location.origin);
+    invite.searchParams.set("token", result.token);
+    return { invitation_id: result.invitation.id, invite_url: invite.toString(), expires_at: result.invitation.expires_at };
   },
   updateMember: (workspaceId: string, memberId: string, input: { role?: WorkspaceRole; status?: "active" | "inactive" }) => request<RawMembership>(
     teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`, { ...patchJson(input), credentials: "include", headers: teamHeaders(workspaceId) },
@@ -481,8 +530,13 @@ interface RawClaimEvidence {
 
 interface RawWiki {
   project_id: string;
-  generated_at: string;
-  sections: Array<{ title: string; claims: Array<{ claim_id: string; content: string; evidence_count: number; updated_at: string }> }>;
+  generated_at?: string;
+  sections: Array<{
+    id?: string;
+    title: string;
+    content?: string;
+    claims?: Array<{ claim_id: string; content: string; evidence_count: number; updated_at: string }>;
+  }>;
 }
 
 interface RawGraph {
@@ -555,7 +609,7 @@ export function normalizeRecall(raw: RawRecall): { items: RecallResult[] } {
 }
 
 export function normalizeClaim(raw: RawClaim): Claim {
-  return { id: raw.id, text: raw.content, status: raw.status, derivation_method: raw.derivation_method, project_id: raw.project_id, updated_at: raw.created_at };
+  return { id: raw.claim_id || raw.id || "unknown", text: raw.content, status: raw.status, derivation_method: raw.derivation_method, project_id: raw.project_id, updated_at: raw.updated_at || raw.created_at };
 }
 
 export function normalizeClaimEvidence(raw: RawClaimEvidence): ClaimEvidence {
@@ -570,10 +624,10 @@ export function normalizeWiki(raw: RawWiki, scope: Scope): WikiDocument {
     title: scope.projectName || "프로젝트 Wiki",
     updated_at: raw.generated_at,
     sections: raw.sections.map((section, index) => ({
-      id: `${index + 1}`,
+      id: section.id || `${index + 1}`,
       heading: section.title,
-      body: section.claims.map(item => `• ${item.content}`).join("\n"),
-      claim_ids: section.claims.map(item => item.claim_id),
+      body: section.content ?? (section.claims || []).map(item => `• ${item.content}`).join("\n"),
+      claim_ids: (section.claims || []).map(item => item.claim_id),
     })),
   };
 }
@@ -697,6 +751,11 @@ function defaultMcpUrl() {
   return `http://${host}:18765/mcp`;
 }
 
+function productMcpUrl() {
+  if (typeof window === "undefined") return "/mcp";
+  return `${window.location.origin}/mcp`;
+}
+
 function managerRequest<T>(path: string, init: RequestInit = {}) {
   return request<T>(managerBase, path, { ...init, manager: true });
 }
@@ -737,4 +796,4 @@ export async function exchangeManagerBootstrap() {
   return true;
 }
 
-export const apiConfig = { coreBase, get managerBase() { return managerBase; } };
+export const apiConfig = { teamBase, get managerBase() { return managerBase; } };

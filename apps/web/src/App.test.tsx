@@ -14,38 +14,95 @@ describe("Neuromem web routes", () => {
 
   it("shows project health and MCP address immediately without setup steps", async () => {
     mockFetch(url => {
-      if (url.endsWith("/v1/workspaces")) return { items: [workspace] };
-      if (url.includes("/v1/workspaces/workspace-1/projects")) return { items: [project] };
-      if (url.includes("/v1/projects/project-1/overview")) return { workspace_id: workspace.id, project_id: project.id, records: 28, claims: 7, sessions: 3, peers: 2, jobs: { pending: 0, running: 0, failed: 0 }, embedding_configured: true, extraction_configured: true, mcp_url: "http://127.0.0.1:18765/mcp" };
-      if (url.includes("/v1/projects/project-1/claims")) return { items: [{ claim: { id: "claim-1", workspace_id: workspace.id, project_id: project.id, content: "근거가 있는 최근 주장", status: "active", derivation_method: "llm_extracted", occurred_at: "2026-08-31T00:00:00Z", created_at: "2026-08-31T00:00:00Z" }, evidence_count: 1 }] };
+      if (url.endsWith("/api/v1/me")) return { principal: { id: "principal-1", email: "aram@example.com", display_name: "아람" }, context: { capabilities: ["project.read"] } };
+      if (url.endsWith("/api/v1/workspaces")) return [workspace];
+      if (url.includes("/api/v1/workspaces/workspace-1/projects")) return [project];
+      if (url.includes("/api/v1/memory/conclusions")) return { items: [{ claim_id: "claim-1", project_id: project.id, content: "근거가 있는 최근 주장", status: "active", derivation_method: "deductive" }] };
       throw new Error(`Unexpected URL ${url}`);
     });
     render(<App />);
     expect(await screen.findByText("기억의 현재 상태")).toBeInTheDocument();
-    expect(screen.getByText("http://127.0.0.1:18765/mcp")).toBeInTheDocument();
-    expect(screen.getByText("주소가 보이고 상태가 정상이라면 바로 사용할 수 있습니다.")).toBeInTheDocument();
+    expect(screen.getByText(`${window.location.origin}/mcp`)).toBeInTheDocument();
+    expect(screen.getByText(/Credential에 묶인 Workspace/)).toBeInTheDocument();
     expect(screen.getByText("근거가 있는 최근 주장")).toBeInTheDocument();
-    expect(screen.queryByText(/Enter/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "그래프" })).not.toBeInTheDocument();
   });
 
-  it("shows one direct create form when no workspace exists", async () => {
-    mockFetch(url => {
-      if (url.endsWith("/v1/workspaces")) return { items: [] };
+  it("supports login, first bootstrap, and invitation acceptance without storing a bearer", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input); calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.endsWith("/api/v1/me")) return new Response(JSON.stringify({ detail: "invalid authentication" }), { status: 401, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/v1/auth/bootstrap")) return new Response(JSON.stringify({ principal: { id: "p", email: "owner@example.com", display_name: "Owner" }, context: { capabilities: ["*"] }, workspace, general_project: project, recovery_credential: { token: "recovery-secret", credential: { token_prefix: "prefix" } } }), { status: 200, headers: { "content-type": "application/json" } });
+      throw new Error(`Unexpected URL ${url}`);
+    }));
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "로그인" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "최초 설정" }));
+    fireEvent.change(screen.getByLabelText("이메일"), { target: { value: "owner@example.com" } });
+    fireEvent.change(screen.getByLabelText("표시 이름"), { target: { value: "Owner" } });
+    fireEvent.change(screen.getByLabelText("Workspace 이름"), { target: { value: "Neuromem Team" } });
+    fireEvent.change(screen.getByLabelText("비밀번호"), { target: { value: "very-secure-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Workspace 생성" }));
+    expect(await screen.findByText("복구 키를 저장하세요")).toBeInTheDocument();
+    expect(screen.getByText("recovery-secret")).toBeInTheDocument();
+    expect(calls.find(call => call.url.endsWith("/auth/bootstrap"))?.body).toMatchObject({ email: "owner@example.com", workspace_name: "Neuromem Team" });
+    expect(localStorage.getItem("neuromem-token")).toBeNull();
+    expect(sessionStorage.getItem("neuromem-token")).toBeNull();
+  });
+
+  it("logs in through the HttpOnly product session and reloads the scoped product", async () => {
+    let authenticated = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/me")) return new Response(JSON.stringify(authenticated
+        ? { principal: { id: "principal-1", email: "aram@example.com", display_name: "아람" }, context: { capabilities: ["project.read"] } }
+        : { detail: "invalid authentication" }), { status: authenticated ? 200 : 401, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/v1/auth/login")) { authenticated = true; return new Response(JSON.stringify({ principal: { id: "principal-1", email: "aram@example.com", display_name: "아람" }, context: { capabilities: ["workspace.create"] } }), { status: 200, headers: { "content-type": "application/json" } }); }
+      if (url.endsWith("/api/v1/workspaces")) return new Response(JSON.stringify([workspace]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.includes("/api/v1/workspaces/workspace-1/projects")) return new Response(JSON.stringify([project]), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/v1/memory/conclusions")) return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { "content-type": "application/json" } });
       throw new Error(`Unexpected URL ${url}`);
     });
+    vi.stubGlobal("fetch", fetchMock);
     render(<App />);
-    expect(await screen.findByText("첫 프로젝트를 만드세요.")).toBeInTheDocument();
-    expect(screen.getByLabelText("Workspace 이름")).toBeInTheDocument();
-    expect(screen.getByLabelText("Project 이름")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "바로 시작" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "로그인" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("이메일"), { target: { value: "aram@example.com" } });
+    fireEvent.change(screen.getByLabelText("비밀번호"), { target: { value: "correct-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "로그인" }));
+    expect(await screen.findByText("기억의 현재 상태")).toBeInTheDocument();
+    const loginCall = fetchMock.mock.calls.find(call => String(call[0]).endsWith("/auth/login"));
+    expect(loginCall?.[1]).toMatchObject({ method: "POST", credentials: "include" });
+    expect(localStorage.getItem("neuromem-token")).toBeNull();
+  });
+
+  it("accepts an invitation from /app/invite and shows the one-time recovery key", async () => {
+    const inviteToken = "invite-token-that-is-at-least-thirty-two-characters";
+    window.history.replaceState(null, "", `/app/invite?token=${inviteToken}`);
+    const bodies: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/v1/me")) return new Response(JSON.stringify({ detail: "invalid authentication" }), { status: 401, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/api/v1/auth/invitations:accept")) { bodies.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ principal: { id: "p", email: "new@example.com", display_name: "New" }, context: { capabilities: ["project.read"] }, workspace, general_project: project, recovery_credential: { token: "invite-recovery-secret", credential: { token_prefix: "prefix" } } }), { status: 200, headers: { "content-type": "application/json" } }); }
+      throw new Error(`Unexpected URL ${url}`);
+    }));
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "팀 초대 수락" })).toBeInTheDocument();
+    expect(screen.getByLabelText("초대 토큰")).toHaveValue(inviteToken);
+    fireEvent.change(screen.getByLabelText("표시 이름"), { target: { value: "New Member" } });
+    fireEvent.change(screen.getByLabelText("비밀번호"), { target: { value: "new-member-password" } });
+    fireEvent.click(screen.getByRole("button", { name: "초대 수락" }));
+    expect(await screen.findByText("invite-recovery-secret")).toBeInTheDocument();
+    expect(bodies).toEqual([{ token: inviteToken, display_name: "New Member", password: "new-member-password" }]);
   });
 
   it("keeps Workspace team and Peer management in the product UI, separate from host Admin", async () => {
     window.history.replaceState(null, "", "/app/team");
     const mutationCalls: string[] = [];
     mockFetch((url, init) => {
-      if (url.endsWith("/core-api/v1/workspaces")) return { items: [workspace] };
-      if (url.includes("/core-api/v1/workspaces/workspace-1/projects")) return { items: [project] };
+      if (url.endsWith("/api/v1/me")) return { principal: { id: "principal-1", email: "aram@example.com", display_name: "아람" }, context: { capabilities: ["*"] } };
+      if (url.endsWith("/api/v1/workspaces")) return [workspace];
+      if (url.includes("/api/v1/workspaces/workspace-1/projects")) return [project];
       if (url.endsWith("/api/v1/workspaces/workspace-1/members")) return [{ id: "member-1", workspace_id: workspace.id, principal_id: "principal-1", role: "owner", status: "active" }];
       if (url.endsWith("/api/v1/workspaces/workspace-1/peer-bindings")) return [{ principal_id: "principal-1", peer: { id: "018f0f86-4d65-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람", kind: "human", status: "active" }, kind: "primary_human", status: "active" }, { principal_id: null, peer: { id: "018f0f86-4d66-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람 Codex", kind: "agent", status: "active" }, kind: "agent_owner", client: "codex", owner_principal_id: "principal-1", status: "active" }, { principal_id: null, peer: { id: "018f0f86-4d67-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람 Claude", kind: "agent", status: "active" }, kind: "agent_owner", client: "claude", owner_principal_id: "principal-1", status: "active" }];
       if (url.endsWith("/api/v1/credentials")) return [{ id: "credential-1", name: "Codex MCP", token_prefix: "nmem_abcd", kind: "mcp", workspace_id: workspace.id, project_ids: [project.id], principal_id: "principal-1", agent_peer_id: "018f0f86-4d66-7a3c-8f2c-123456789abc", capabilities: ["memory:read"] }];
@@ -71,24 +128,20 @@ describe("Neuromem web routes", () => {
     expect(await screen.findByText("이관 요청을 승인했습니다.")).toBeInTheDocument();
   });
 
-  it("renders an accessible graph and drills from a relation into record evidence", async () => {
+  it("omits unsupported graph, claim-evidence, and record-context surfaces in team mode", async () => {
     window.history.replaceState(null, "", "/app/graph");
-    mockFetch(url => {
-      if (url.endsWith("/v1/workspaces")) return { items: [workspace] };
-      if (url.includes("/v1/workspaces/workspace-1/projects")) return { items: [project] };
-      if (url.includes("/v1/projects/project-1/graph")) return { nodes: [{ id: "project:1", type: "project", label: "Neuromem" }, { id: "decision:1", type: "decision", label: "Embedding" }], edges: [{ id: "edge-1", claim_id: "claim-1", source: "project:1", predicate: "USES", target: "decision:1" }] };
-      if (url.includes("/v1/claims/claim-1/evidence")) return { claim: { id: "claim-1", project_id: project.id, content: "2560차원 임베딩을 사용한다", status: "active", derivation_method: "explicit", created_at: "2026-08-31T00:00:00Z" }, evidence: [{ source_id: "source-1", role: "supports", quote: "2560으로 정하자", record: { id: "record-1", kind: "message", content: "2560으로 정하자", occurred_at: "2026-08-31T00:00:00Z", source_app: "codex", project_id: project.id } }] };
-      if (url.includes("/v1/records/record-1/context")) return { target_record_id: "record-1", records: [{ id: "record-1", kind: "message", content: "2560으로 정하자", occurred_at: "2026-08-31T00:00:00Z", source_app: "codex", project_id: project.id }] };
+    const seen: string[] = [];
+    mockFetch(url => { seen.push(url);
+      if (url.endsWith("/api/v1/me")) return { principal: { id: "principal-1", email: "aram@example.com", display_name: "아람" }, context: { capabilities: ["project.read"] } };
+      if (url.endsWith("/api/v1/workspaces")) return [workspace];
+      if (url.includes("/api/v1/workspaces/workspace-1/projects")) return [project];
+      if (url.includes("/api/v1/memory/conclusions")) return { items: [] };
       throw new Error(`Unexpected URL ${url}`);
     });
     render(<App />);
-    expect(await screen.findByRole("img", { name: "프로젝트 기억 관계 그래프" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Neuromem.*USES.*Embedding/ }));
-    expect(await screen.findByText("2560차원 임베딩을 사용한다")).toBeInTheDocument();
-    expect(screen.getByText("2560으로 정하자")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /supports.*2560으로 정하자/ }));
-    expect(await screen.findByText("원본 기록")).toBeInTheDocument();
-    expect(screen.getByText("codex")).toBeInTheDocument();
+    expect(await screen.findByText("기억의 현재 상태")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "그래프" })).not.toBeInTheDocument();
+    expect(seen.some(url => /graph|evidence|record.*context/.test(url))).toBe(false);
   });
 
   it("does not offer a start button when a Node is healthy", async () => {

@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
+import { uuid7 } from "./ids.js";
 import { FederatedMemoryRouter } from "./router.js";
+import { TeamGatewayClient } from "./team-gateway-client.js";
 import type { AuthContext, JsonObject, ToolDefinition } from "./types.js";
 
 export type McpAuthMode = "legacy" | "team" | "hybrid";
@@ -6,6 +9,8 @@ export type McpAuthMode = "legacy" | "team" | "hybrid";
 export interface MemoryToolDispatcherOptions {
   authMode?: McpAuthMode;
   authContext?: AuthContext;
+  teamGateway?: TeamGatewayClient;
+  bearerToken?: string;
 }
 
 const uuidProperty = { type: "string", format: "uuid" };
@@ -199,7 +204,7 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
-        query: teamRecallProperties.query, token_budget: { type: "integer", minimum: 256, maximum: 100_000 },
+        query: teamRecallProperties.query, token_budget: { type: "integer", minimum: 256, maximum: 128_000 },
         include_general: { type: "boolean", default: true }, include_federated: { type: "boolean", default: false }
       },
       required: ["query"]
@@ -210,14 +215,14 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
-        query: teamRecallProperties.query, reasoning_level: { type: "string", enum: ["low", "medium", "high"] },
+        query: teamRecallProperties.query, reasoning_level: { type: "string", enum: ["minimal", "low", "medium", "high"] },
         include_general: { type: "boolean", default: true }, include_federated: { type: "boolean", default: false }
       }, required: ["query"]
     }
   },
   {
     name: "schedule_dream", description: "Schedule memory consolidation for the current Project",
-    inputSchema: { type: "object", additionalProperties: false, properties: { strategy: { type: "string", enum: ["default", "deduction", "induction", "surprisal"] }, force: { type: "boolean", default: false } } }
+    inputSchema: { type: "object", additionalProperties: false, properties: { strategy: { type: "string", enum: ["omni", "deduction", "induction", "surprisal"] }, force: { type: "boolean", default: false } } }
   },
   {
     name: "federated_search", description: "Search explicitly granted external Projects with source Workspace, Project, Peer, and grant metadata",
@@ -269,7 +274,7 @@ const TOOL_CAPABILITY: Record<string, string> = {
   recall: "project.read",
   get_record_context: "project.read",
   get_claim_evidence: "project.read",
-  wiki_read: "wiki:read",
+  wiki_read: "wiki.read",
   graph_read: "project.read",
   representation_read: "project.read",
   peer_card_read: "project.read",
@@ -278,8 +283,10 @@ const TOOL_CAPABILITY: Record<string, string> = {
   dialectic_chat: "project.read",
   schedule_dream: "project.write",
   federated_search: "project.read",
-  transfer_request: "transfer:request"
+  transfer_request: "transfer.request"
 };
+
+const TEAM_GATEWAY_UNSUPPORTED = new Set(["get_record_context", "get_claim_evidence", "graph_read"]);
 
 function objectInput(value: unknown): JsonObject {
   if (value === undefined) return {};
@@ -420,12 +427,17 @@ function recallInput(input: JsonObject, router: FederatedMemoryRouter): JsonObje
 export class MemoryToolDispatcher {
   readonly authMode: McpAuthMode;
   readonly authContext?: AuthContext;
+  readonly #teamGateway?: TeamGatewayClient;
+  readonly #bearerToken?: string;
 
-  constructor(readonly router: FederatedMemoryRouter, options: MemoryToolDispatcherOptions = {}) {
+  constructor(readonly router: FederatedMemoryRouter | undefined, options: MemoryToolDispatcherOptions = {}) {
     this.authMode = options.authMode ?? "hybrid";
     this.authContext = options.authContext;
+    this.#teamGateway = options.teamGateway;
+    this.#bearerToken = options.bearerToken;
     if (!(["legacy", "team", "hybrid"] as string[]).includes(this.authMode)) throw new Error("authMode must be legacy, team, or hybrid");
-    if (this.authMode === "team" && !this.authContext) throw new Error("team auth mode requires an AuthContext");
+    if (this.#teamGateway && (!this.authContext || !this.#bearerToken)) throw new Error("team Gateway requests require AuthContext and a transient bearer");
+    if (!this.router && !this.#teamGateway && this.authMode !== "team") throw new Error("legacy and hybrid modes require a memory router");
     if (this.authContext) {
       for (const key of ["principal_id", "credential_id", "workspace_id", "project_id", "human_peer_id"] as const) {
         if (!this.authContext[key]) throw new Error(`AuthContext.${key} is required`);
@@ -438,12 +450,16 @@ export class MemoryToolDispatcher {
     return new MemoryToolDispatcher(this.router, { authContext, authMode });
   }
 
+  withTeamRequest(authContext: AuthContext, gateway: TeamGatewayClient, bearerToken: string): MemoryToolDispatcher {
+    return new MemoryToolDispatcher(undefined, { authContext, authMode: "team", teamGateway: gateway, bearerToken });
+  }
+
   listTools(): ToolDefinition[] {
     let tools: readonly ToolDefinition[];
     if (this.authMode === "legacy" || !this.authContext) {
       tools = MEMORY_TOOLS;
     } else if (this.authMode === "team") {
-      tools = TEAM_MEMORY_TOOLS.filter((tool) => this.#hasCapability(TOOL_CAPABILITY[tool.name]!));
+      tools = TEAM_MEMORY_TOOLS.filter((tool) => (!this.#teamGateway || !TEAM_GATEWAY_UNSUPPORTED.has(tool.name)) && this.#hasCapability(TOOL_CAPABILITY[tool.name]!));
     } else {
       tools = [
         ...MEMORY_TOOLS.filter((tool) => this.#hasCapability(TOOL_CAPABILITY[tool.name]!)),
@@ -465,12 +481,13 @@ export class MemoryToolDispatcher {
   }
 
   async #callLegacy(name: string, input: JsonObject): Promise<unknown> {
+    const router = this.#legacyRouter();
     rejectUnknown(name, input);
-    const targets = this.router.targetsFor(targetValue(input));
+    const targets = router.targetsFor(targetValue(input));
     switch (name) {
       case "memory_record":
         validateMemoryRecord(input);
-        return this.router.memoryRecord({
+        return router.memoryRecord({
           ...input,
           workspace_id: requiredUuid(input, "workspace_id"),
           project_id: requiredUuid(input, "project_id"),
@@ -481,24 +498,24 @@ export class MemoryToolDispatcher {
           content: requiredString(input, "content"),
           targets
         });
-      case "search_records": return this.router.recall(recallInput(input, this.router), ["records"]);
-      case "search_claims": return this.router.recall(recallInput(input, this.router), ["claims"]);
-      case "recall": return this.router.recall(recallInput(input, this.router), ["records", "claims"]);
+      case "search_records": return router.recall(recallInput(input, router), ["records"]);
+      case "search_claims": return router.recall(recallInput(input, router), ["claims"]);
+      case "recall": return router.recall(recallInput(input, router), ["records", "claims"]);
       case "get_record_context": {
         const { workspaceId, projectId } = scope(input);
-        return this.router.getRecordContext(workspaceId, projectId, requiredUuid(input, "record_id"), targets);
+        return router.getRecordContext(workspaceId, projectId, requiredUuid(input, "record_id"), targets);
       }
       case "get_claim_evidence": {
         const { workspaceId, projectId } = scope(input);
-        return this.router.getClaimEvidence(workspaceId, projectId, requiredUuid(input, "claim_id"), targets);
+        return router.getClaimEvidence(workspaceId, projectId, requiredUuid(input, "claim_id"), targets);
       }
       case "wiki_read": {
         const { workspaceId, projectId } = scope(input);
-        return this.router.wikiRead(workspaceId, projectId, targets);
+        return router.wikiRead(workspaceId, projectId, targets);
       }
       case "graph_read": {
         const { workspaceId, projectId } = scope(input);
-        return this.router.graphRead(workspaceId, projectId, targets);
+        return router.graphRead(workspaceId, projectId, targets);
       }
       default: throw new Error(`unknown memory tool '${name}'`);
     }
@@ -508,99 +525,152 @@ export class MemoryToolDispatcher {
     if (!this.authContext) throw new Error("credential-bound AuthContext is required");
     rejectUnknownTeam(name, input);
     this.#requireCapability(name);
-    const workspaceId = this.authContext.workspace_id;
-    const projectId = this.authContext.project_id;
+    const gateway = this.#teamGateway;
+    const bearer = this.#bearerToken;
+    if (!gateway || !bearer) throw new Error("team mode requires the Control Gateway and an incoming bearer credential");
+    return this.#callTeamGateway(gateway, bearer, name, input);
+  }
+
+  async #callTeamGateway(gateway: TeamGatewayClient, bearer: string, name: string, input: JsonObject): Promise<unknown> {
+    const context = this.authContext!;
+    const workspaceId = context.workspace_id;
+    const projectId = context.project_id;
     switch (name) {
       case "memory_record": {
         const speaker = requiredString(input, "speaker");
         if (speaker !== "human" && speaker !== "agent") throw new Error("speaker must be 'human' or 'agent'");
-        const peerId = speaker === "human" ? this.authContext.human_peer_id : this.authContext.agent_peer_id;
+        const peerId = speaker === "human" ? context.human_peer_id : context.agent_peer_id;
         if (!peerId) throw new Error("this credential is not bound to an Agent Peer");
-        const recordInput = {
-          ...input,
-          author_key: peerId,
-          author_name: peerId,
-          author_kind: speaker,
-          source_app: this.authContext.client ?? "neuromem-mcp"
-        };
-        validateMemoryRecord(recordInput);
-        return this.router.memoryRecord({
-          ...recordInput,
+        const sessionId = requiredUuid7(input, "session_id");
+        const recordId = optionalUuid7(input, "record_id") ?? uuid7();
+        const content = requiredString(input, "content");
+        if (content.length > 1_000_000 || content.includes("\0")) throw new Error("content is invalid or too long");
+        optionalDateTime(input, "occurred_at");
+        if (input.metadata !== undefined && (input.metadata === null || typeof input.metadata !== "object" || Array.isArray(input.metadata))) {
+          throw new Error("metadata must be an object");
+        }
+        const kind = input.kind === undefined ? "message" : String(input.kind);
+        if (!["message", "file", "commit", "tool_result", "correction", "note"].includes(kind)) throw new Error("kind is invalid");
+        const suppliedKey = optionalString(input, "idempotency_key", 512);
+        const idempotencyKey = suppliedKey ?? createHash("sha256")
+          .update(`${context.credential_id}:${projectId}:${sessionId}:${recordId}`)
+          .digest("hex");
+        return gateway.record(context, bearer, sessionId, {
           workspace_id: workspaceId,
           project_id: projectId,
-          session_id: requiredUuid7(input, "session_id"),
-          record_id: optionalUuid7(input, "record_id"),
-          author_key: peerId,
-          author_kind: speaker,
-          content: requiredString(input, "content")
+          session_id: sessionId,
+          records: [{
+            id: recordId,
+            author_key: peerId,
+            author_name: peerId,
+            author_kind: speaker,
+            kind,
+            content,
+            source_app: context.client ?? "neuromem-mcp",
+            metadata: input.metadata ?? {},
+            ...(input.occurred_at ? { occurred_at: input.occurred_at } : {})
+          }]
+        }, idempotencyKey);
+      }
+      case "search_records":
+        return gateway.request("POST", "/api/v1/recall", context, bearer, { body: this.#gatewayRecall(input, ["records"]) });
+      case "search_claims":
+        return gateway.request("POST", "/api/v1/recall", context, bearer, { body: this.#gatewayRecall(input, ["claims"]) });
+      case "recall":
+        return gateway.request("POST", "/api/v1/recall", context, bearer, { body: this.#gatewayRecall(input, ["records", "claims"]) });
+      case "wiki_read":
+        return gateway.request("GET", `/api/v1/projects/${encodeURIComponent(projectId)}/wiki`, context, bearer);
+      case "representation_read": {
+        const peerId = this.#readablePeer(input);
+        return gateway.request("GET", `/api/v1/peers/${encodeURIComponent(peerId)}/representation`, context, bearer, {
+          query: { workspace_id: workspaceId, project_id: projectId, include_general: optionalBoolean(input, "include_general", true) }
         });
       }
-      case "search_records": return this.router.recall(this.#teamRecall(input), ["records"]);
-      case "search_claims": return this.router.recall(this.#teamRecall(input), ["claims"]);
-      case "recall": return this.router.recall(this.#teamRecall(input), ["records", "claims"]);
-      case "get_record_context": return this.router.getRecordContext(workspaceId, projectId, requiredUuid(input, "record_id"));
-      case "get_claim_evidence": return this.router.getClaimEvidence(workspaceId, projectId, requiredUuid(input, "claim_id"));
-      case "wiki_read": return this.router.wikiRead(workspaceId, projectId);
-      case "graph_read": return this.router.graphRead(workspaceId, projectId);
-      case "representation_read": return this.router.representationRead(workspaceId, projectId, this.#readablePeer(input), optionalBoolean(input, "include_general", true));
-      case "peer_card_read": return this.router.peerCardRead(workspaceId, projectId, this.#readablePeer(input), optionalBoolean(input, "include_general", true));
-      case "session_context": return this.router.sessionContextRead(workspaceId, projectId, requiredUuid7(input, "session_id"), optionalBoolean(input, "include_general", true));
+      case "peer_card_read": {
+        const peerId = this.#readablePeer(input);
+        return gateway.request("GET", `/api/v1/peers/${encodeURIComponent(peerId)}/card`, context, bearer, {
+          query: { workspace_id: workspaceId, project_id: projectId, include_general: optionalBoolean(input, "include_general", true) }
+        });
+      }
+      case "session_context":
+        return gateway.request("GET", `/api/v1/sessions/${encodeURIComponent(requiredUuid7(input, "session_id"))}/context`, context, bearer, {
+          query: { workspace_id: workspaceId, project_id: projectId, include_general: optionalBoolean(input, "include_general", true) }
+        });
       case "dynamic_context": {
         const tokenBudget = input.token_budget;
-        if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || Number(tokenBudget) < 256 || Number(tokenBudget) > 100_000)) throw new Error("token_budget must be an integer from 256 to 100000");
-        return this.router.dynamicContext({
-          workspace_id: workspaceId, project_id: projectId, query: this.#query(input), token_budget: tokenBudget,
+        if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || Number(tokenBudget) < 256 || Number(tokenBudget) > 128_000)) {
+          throw new Error("token_budget must be an integer from 256 to 128000");
+        }
+        return gateway.request("POST", "/api/v1/context", context, bearer, { body: {
+          workspace_id: workspaceId,
+          project_id: projectId,
+          query: this.#query(input),
+          ...(tokenBudget === undefined ? {} : { token_budget: tokenBudget }),
           include_general: optionalBoolean(input, "include_general", true),
           include_federated: optionalBoolean(input, "include_federated", false)
-        });
+        } });
       }
       case "dialectic_chat": {
         const level = input.reasoning_level ?? "low";
-        if (!["low", "medium", "high"].includes(String(level))) throw new Error("reasoning_level is invalid");
-        return this.router.dialecticChat({
-          workspace_id: workspaceId, project_id: projectId, query: this.#query(input), reasoning_level: level,
+        if (!["minimal", "low", "medium", "high"].includes(String(level))) throw new Error("reasoning_level is invalid");
+        return gateway.request("POST", "/api/v1/chat", context, bearer, { body: {
+          workspace_id: workspaceId,
+          project_id: projectId,
+          query: this.#query(input),
+          reasoning_level: level,
           include_general: optionalBoolean(input, "include_general", true),
           include_federated: optionalBoolean(input, "include_federated", false)
-        });
+        } });
       }
       case "schedule_dream": {
-        const strategy = input.strategy ?? "default";
-        if (!["default", "deduction", "induction", "surprisal"].includes(String(strategy))) throw new Error("strategy is invalid");
-        return this.router.scheduleDream(workspaceId, projectId, { strategy, force: optionalBoolean(input, "force", false) });
+        const strategy = input.strategy ?? "omni";
+        if (!["omni", "deduction", "induction", "surprisal"].includes(String(strategy))) throw new Error("strategy is invalid");
+        return gateway.request("POST", "/api/v1/dreams", context, bearer, { body: {
+          workspace_id: workspaceId,
+          project_id: projectId,
+          strategy,
+          force: optionalBoolean(input, "force", false)
+        } });
       }
-      case "federated_search": return this.router.recall({ ...this.#teamRecall({ ...input, include_federated: true }), include_federated: true }, ["records", "claims"]);
+      case "federated_search":
+        return gateway.request("POST", "/api/v1/recall", context, bearer, { body: this.#gatewayRecall({ ...input, include_federated: true }, ["records", "claims"]) });
       case "transfer_request": {
         const contentHash = requiredString(input, "source_content_hash");
         if (!/^[0-9a-f]{64}$/.test(contentHash)) throw new Error("source_content_hash must be a lowercase SHA-256 hex digest");
         const snapshot = requiredString(input, "source_snapshot");
         if (snapshot.length > 1_000_000 || snapshot.includes("\0")) throw new Error("source_snapshot is invalid or too long");
-        return this.router.createTransferRequest(workspaceId, projectId, {
+        return gateway.request("POST", "/api/v1/transfer-requests", context, bearer, { body: {
+          source_workspace_id: workspaceId,
+          source_project_id: projectId,
           target_workspace_id: requiredUuid(input, "target_workspace_id"),
           target_project_id: requiredUuid(input, "target_project_id"),
           source_record_id: requiredUuid(input, "record_id"),
           source_content_hash: contentHash,
           source_snapshot: snapshot,
           provenance: { reason: requiredString(input, "reason") }
-        });
+        } });
       }
-      default: throw new Error(`unknown memory tool '${name}'`);
+      default:
+        if (TEAM_GATEWAY_UNSUPPORTED.has(name)) throw new Error(`team Gateway does not support '${name}'`);
+        throw new Error(`unknown memory tool '${name}'`);
     }
   }
 
-  #teamRecall(input: JsonObject): JsonObject & {
-    workspace_id: string; project_id: string; query: string; limit?: number; include_general: boolean; include_federated: boolean;
-  } {
+  #gatewayRecall(input: JsonObject, include: Array<"records" | "claims">): JsonObject {
     if (input.session_id !== undefined) requiredUuid7(input, "session_id");
     optionalDateTime(input, "after");
     optionalDateTime(input, "before");
     return {
-      ...input,
       workspace_id: this.authContext!.workspace_id,
       project_id: this.authContext!.project_id,
       query: this.#query(input),
-      limit: optionalLimit(input),
+      include,
+      limit: optionalLimit(input) ?? 10,
       include_general: optionalBoolean(input, "include_general", true),
-      include_federated: optionalBoolean(input, "include_federated", false)
+      include_federated: optionalBoolean(input, "include_federated", false),
+      ...(input.session_id ? { session_id: input.session_id } : {}),
+      ...(input.after ? { after: input.after } : {}),
+      ...(input.before ? { before: input.before } : {})
     };
   }
 
@@ -623,6 +693,11 @@ export class MemoryToolDispatcher {
     return this.authContext.capabilities.includes("*")
       || this.authContext.capabilities.includes(capability)
       || (capability === "transfer.request" && this.authContext.capabilities.includes("transfer.manage"));
+  }
+
+  #legacyRouter(): FederatedMemoryRouter {
+    if (!this.router) throw new Error("legacy memory router is not configured");
+    return this.router;
   }
 
   #requireCapability(name: string): void {

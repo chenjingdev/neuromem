@@ -5,6 +5,7 @@ export { uuid7 } from "./ids.js";
 export { dispatchRpc, RpcError } from "./rpc.js";
 export { DurableRetryQueue } from "./retry-queue.js";
 export { FederatedMemoryRouter } from "./router.js";
+export { TeamGatewayClient, TeamGatewayError } from "./team-gateway-client.js";
 export { MEMORY_TOOLS, TEAM_MEMORY_TOOLS, MemoryToolDispatcher } from "./tools.js";
 export type { McpAuthMode, MemoryToolDispatcherOptions } from "./tools.js";
 export type {

@@ -4,21 +4,18 @@ A dependency-free Node.js 20+ adapter for both local Core routing and credential
 
 ## Team mode
 
-Team deployments point the adapter at Control and a Gateway/Core target:
+Team deployments point the adapter only at Control:
 
 ```text
 NEUROMEM_CONTROL_API_URL=http://control:8080
-NEUROMEM_MCP_AUTH_MODE=team
-NEUROMEM_CORE_URL=http://gateway:8081/api
-NEUROMEM_CORE_TOKEN=<internal Gateway token>
 NEUROMEM_MCP_ALLOW_REMOTE=true
 ```
 
-Each incoming bearer credential is resolved through `GET /api/v1/me`. The returned `AuthContext` pins `principal_id`, `credential_id`, Workspace, Project, Human Peer, optional Agent Peer, capabilities, and request ID to the MCP session. A credential cannot be swapped after `initialize`, and tool arguments cannot choose another scope or author.
+Each incoming bearer credential is resolved through `GET /api/v1/me`. The returned `AuthContext` pins `principal_id`, `credential_id`, Workspace, Project, Human Peer, optional Agent Peer, capabilities, and request ID to the MCP session. A credential cannot be swapped after `initialize`, and tool arguments cannot choose another scope or author. Every tool call is then sent to a documented `/api/v1` Control Gateway alias with that request's bearer; the adapter does not store the bearer in session state, on disk, or in logs.
 
-Team mode exposes recording, source/conclusion recall, evidence, Representation, Peer Card, Session Context, Wiki, graph, Dynamic Context, Dialectic chat, Dream scheduling, explicitly granted federated search, and audited transfer requests. Recall defaults to `include_general=true` and `include_federated=false`. A record's `speaker` selects only between the credential-bound Human Peer and Agent Peer.
+Team mode exposes recording, source/conclusion recall, Representation, Peer Card, Session Context, Wiki, Dynamic Context, Dialectic chat, Dream scheduling, explicitly granted federated search, and audited transfer requests. Recall defaults to `include_general=true` and `include_federated=false`. A record's `speaker` selects only between the credential-bound Human Peer and Agent Peer. Record-neighbor context, Claim evidence, and graph tools are intentionally absent until Control provides matching scoped aliases.
 
-For a fixed local development identity, `NEUROMEM_MCP_AUTH_CONTEXT` may contain the complete JSON `AuthContext`. If neither Control nor a static context is configured, the adapter retains its local routing contract.
+`NEUROMEM_MCP_AUTH_CONTEXT` remains available only for legacy/hybrid development. HTTP team mode fails closed unless `NEUROMEM_CONTROL_API_URL` is configured.
 
 ## Configuration
 

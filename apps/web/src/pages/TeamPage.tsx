@@ -5,7 +5,7 @@ import { Button, Card, EmptyState, ErrorState, formatDate, LoadingState, PageHea
 import { useRemote } from "../hooks";
 import type { CreatedCredential, Scope, WorkspaceRole } from "../types";
 
-const DEFAULT_CAPABILITIES = ["project.read", "project.write", "wiki.read", "wiki.write", "transfer.manage"];
+const DEFAULT_CAPABILITIES = ["project.read", "project.write", "wiki.read", "wiki.write", "transfer.request"];
 
 export function TeamPage({ scope }: { scope: Scope }) {
   const remote = useRemote(() => teamApi.dashboard(scope), [scope.workspaceId, scope.projectId]);
