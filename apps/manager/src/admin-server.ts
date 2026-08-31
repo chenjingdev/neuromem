@@ -66,6 +66,7 @@ export class AdminServer {
     if (this.#reconcileTimer) clearInterval(this.#reconcileTimer);
     this.#reconcileTimer = null;
     await Promise.all([close(this.#tcp), close(this.#unix)]);
+    await this.options.manager.close();
     this.#tcp = null;
     this.#unix = null;
     if (this.#socketOwned) await fs.rm(this.options.paths.socket, { force: true });
@@ -90,6 +91,20 @@ export class AdminServer {
         return;
       }
       if (url.pathname === "/v1/openapi.json" && request.method === "GET") return sendJson(response, 200, managerOpenApi);
+      const codexBridge = match(url.pathname, /^\/v1\/internal\/codex\/nodes\/([^/]+)\/(models|chat\/completions)$/);
+      if (codexBridge && ((codexBridge[2] === "models" && request.method === "GET") || (codexBridge[2] === "chat/completions" && request.method === "POST"))) {
+        try {
+          const value = codexBridge[2] === "models"
+            ? await this.options.manager.codexBridgeModels(codexBridge[1]!, request.headers.authorization)
+            : await this.options.manager.codexChatCompletion(codexBridge[1]!, request.headers.authorization, await readBody(request));
+          return sendJson(response, 200, value);
+        } catch (error) {
+          const message = String((error as Error).message || "");
+          if (/authorization/i.test(message)) return sendOpenAiError(response, 401, "Invalid Node bridge authorization", "invalid_request_error");
+          if (/invalid|unsupported|does not match/i.test(message)) return sendOpenAiError(response, 400, "Invalid Codex generation request", "invalid_request_error");
+          return sendOpenAiError(response, 503, "Codex generation is temporarily unavailable", "provider_unavailable");
+        }
+      }
       if (url.pathname === "/v1/admin/session" && request.method === "POST" && transport === "tcp") {
         if (!request.headers.origin) return sendError(response, 403, "A same-origin browser request is required");
         if (!this.allowOrigin(request, response)) return sendError(response, 403, "Origin is not allowed");
@@ -149,6 +164,17 @@ export class AdminServer {
       if (url.pathname === "/v1/nodes" && request.method === "GET") {
         const registry = await this.options.manager.store.registry();
         return sendJson(response, 200, { nodes: registry.nodes, default_node_id: registry.default_node_id });
+      }
+      const modelSelection = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/models$/);
+      if (modelSelection && request.method === "GET") {
+        return sendJson(response, 200, await this.options.manager.modelSelection(modelSelection[1]!));
+      }
+      if (modelSelection && request.method === "POST") {
+        return sendJson(response, 200, await this.options.manager.selectModels(modelSelection[1]!, await readBody(request)));
+      }
+      const generationProbe = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/generation\/probe$/);
+      if (generationProbe && request.method === "POST") {
+        return sendJson(response, 200, await this.options.manager.generationProbe(generationProbe[1]!, await readBody(request)));
       }
       const route = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/(health|backlog|logs|start|stop|restart|backups)$/);
       if (route) {
@@ -291,6 +317,10 @@ function sendError(response: ServerResponse, status: number, error: string): voi
   sendJson(response, status, { ok: false, error });
 }
 
+function sendOpenAiError(response: ServerResponse, status: number, message: string, type: string): void {
+  sendJson(response, status, { error: { message, type, code: type } });
+}
+
 function cookie(request: IncomingMessage, name: string): string {
   for (const part of String(request.headers.cookie || "").split(";")) {
     const [key, ...value] = part.trim().split("=");
@@ -317,7 +347,7 @@ function contentType(target: string): string {
 
 function redactError(value: string): string {
   return String(value)
-    .replace(/(POSTGRES_PASSWORD|API_TOKEN|MCP_TOKEN|EMBEDDING_API_KEY|GENERATION_API_KEY|CORE_TOKEN|authorization)(\s*[=:]\s*)[^\s,}]+/gi, "$1$2[redacted]")
+    .replace(/(POSTGRES_PASSWORD|API_TOKEN|MCP_TOKEN|EMBEDDING_API_KEY|GENERATION_API_KEY|GENERATION_DIRECT_API_KEY|CORE_TOKEN|authorization)(\s*[=:]\s*)[^\s,}]+/gi, "$1$2[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]")
     .replace(/(postgres(?:ql)?(?:\+[a-z0-9]+)?:\/\/[^:\s/]+:)[^@\s]+(@)/gi, "$1[redacted]$2")
     .replace(/neuromem-admin=[^&#\s]+/gi, "neuromem-admin=[redacted]");

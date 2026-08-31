@@ -6,6 +6,11 @@ export const managerOpenApi = {
     "/health": { get: { summary: "Manager liveness" } },
     "/v1/nodes": { get: { summary: "List local Nodes" } },
     "/v1/nodes/{id}/health": { get: { summary: "Inspect Node and component health" } },
+    "/v1/nodes/{id}/models": {
+      get: { summary: "Read model selections, generation sources, and secret-free connection status" },
+      post: { summary: "Select models and either Codex login or an OpenAI-compatible generation API" },
+    },
+    "/v1/nodes/{id}/generation/probe": { post: { summary: "Probe a generation connection without saving it" } },
     "/v1/nodes/{id}/backlog": { get: { summary: "Inspect processing backlog" } },
     "/v1/nodes/{id}/logs": { get: { summary: "Read bounded, redacted logs" } },
     "/v1/nodes/{id}/start": { post: { summary: "Start the complete Node" } },

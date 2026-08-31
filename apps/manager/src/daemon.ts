@@ -14,6 +14,7 @@ const manager = new NodeManager({
   runner: new ProcessRunner(),
   managerPort,
   imageContextRoot: runtime.NEUROMEM_IMAGE_CONTEXT_ROOT,
+  codexBinary: runtime.NEUROMEM_CODEX_BINARY,
 });
 const server = new AdminServer({ manager, paths, port: managerPort });
 

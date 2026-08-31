@@ -136,6 +136,91 @@ export interface HealthCheck {
   detail?: string;
 }
 
+export type ModelProviderState = "unconfigured" | "configured" | "unknown" | "ready" | "error";
+
+export interface ModelProviderStatus {
+  configured: boolean;
+  model?: string;
+  provider_status: ModelProviderState;
+  provider_detail: string | null;
+  last_probe_at: string | null;
+}
+
+export interface ModelSelectionProvider {
+  model: string | null;
+  available_models: string[];
+  diagnostic: string | null;
+}
+
+export type GenerationSource = "codex_session" | "openai_compatible";
+export type CodexAuthStatus = "signed_in" | "signed_out" | "unavailable" | "unknown";
+export type ApiKeyAction = "keep" | "replace" | "clear";
+
+export interface CodexGenerationSource {
+  available: boolean;
+  auth_status: CodexAuthStatus;
+  plan_type: string | null;
+  available_models: string[];
+  diagnostic: string | null;
+  last_checked_at: string | null;
+}
+
+export interface ApiGenerationSource {
+  configured: boolean;
+  connection_origin: string | null;
+  display_base_url: string | null;
+  api_key_configured: boolean;
+  model: string | null;
+  available_models: string[];
+  diagnostic: string | null;
+  last_checked_at: string | null;
+}
+
+export interface GenerationModelSelection extends ModelSelectionProvider {
+  active_source: GenerationSource | null;
+  sources: {
+    codex_session: CodexGenerationSource;
+    openai_compatible: ApiGenerationSource;
+  };
+}
+
+export interface NodeModelSelection {
+  node_id: string;
+  embedding: ModelSelectionProvider;
+  generation: GenerationModelSelection;
+}
+
+export interface ApiGenerationConnectionInput {
+  base_url: string;
+  api_key_action: ApiKeyAction;
+  api_key?: string;
+}
+
+export type GenerationProbeInput =
+  | { source: "codex_session"; model?: string }
+  | { source: "openai_compatible"; model?: string; connection: ApiGenerationConnectionInput };
+
+export interface GenerationProbeResult {
+  source: GenerationSource;
+  available_models: string[];
+  model_compatible: boolean;
+  diagnostic: string | null;
+  auth_status?: CodexAuthStatus;
+  plan_type?: string | null;
+  display_base_url?: string | null;
+  api_key_configured?: boolean;
+  codex?: Partial<CodexGenerationSource>;
+}
+
+export type GenerationSelectionUpdate =
+  | { source: "codex_session"; model: string }
+  | { source: "openai_compatible"; model: string; connection: ApiGenerationConnectionInput };
+
+export interface ModelSelectionUpdate {
+  embedding_model?: string;
+  generation?: GenerationSelectionUpdate;
+}
+
 export interface NodeHealth {
   node?: NodeSummary;
   docker_available?: boolean;
@@ -145,6 +230,10 @@ export interface NodeHealth {
   checks?: HealthCheck[];
   components?: Array<{ name: string; state: ServiceState | string; health?: string; detail?: string }>;
   endpoints?: Record<string, string>;
+  models?: {
+    embedding: ModelProviderStatus;
+    extraction: ModelProviderStatus;
+  };
   error?: string;
   storage?: {
     database_bytes?: number;

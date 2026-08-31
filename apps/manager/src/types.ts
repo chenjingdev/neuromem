@@ -95,6 +95,26 @@ export interface ComponentStatus {
   detail?: string;
 }
 
+export type ModelProviderState =
+  | "unconfigured"
+  | "configured"
+  | "unknown"
+  | "ready"
+  | "error";
+
+export interface ModelProviderStatus {
+  configured: boolean;
+  model?: string;
+  provider_status: ModelProviderState;
+  provider_detail: string | null;
+  last_probe_at: string | null;
+}
+
+export interface NodeModelStatus {
+  embedding: ModelProviderStatus;
+  extraction: ModelProviderStatus;
+}
+
 export interface NodeStatus {
   node: NodeRecord;
   docker_available: boolean;
@@ -105,6 +125,7 @@ export interface NodeStatus {
     dashboard: string;
     mcp: string;
   };
+  models?: NodeModelStatus;
   error?: string;
 }
 

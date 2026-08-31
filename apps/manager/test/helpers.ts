@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { CommandResult, CommandRunner, RunOptions } from "../src/types.js";
+import type { CodexGenerationRequest, CodexProvider, CodexSessionStatus } from "../src/codex-provider.js";
 import { resolveManagerPaths } from "../src/paths.js";
 
 export class FakeRunner implements CommandRunner {
@@ -49,6 +50,28 @@ export class FakeRunner implements CommandRunner {
     return { ok: true, code: 0, stdout: "ok", stderr: "" };
   }
 }
+
+export class FakeCodexProvider implements CodexProvider {
+  readonly requests: CodexGenerationRequest[] = [];
+  status: CodexSessionStatus = {
+    available: true,
+    auth_status: "signed_in",
+    plan_type: "test",
+    available_models: ["gpt-5.6-luna", "gpt-5.6-terra"],
+    diagnostic: null,
+    last_checked_at: "2026-08-31T00:00:00.000Z",
+  };
+  output: Record<string, unknown> = { ok: true };
+
+  async sessionStatus(): Promise<CodexSessionStatus> { return structuredClone(this.status); }
+  async generateJson(request: CodexGenerationRequest): Promise<string> {
+    this.requests.push(structuredClone(request));
+    return JSON.stringify(this.output);
+  }
+  async close(): Promise<void> {}
+}
+
+export function fakeCodex(): FakeCodexProvider { return new FakeCodexProvider(); }
 
 export async function temporaryPaths(prefix = "neuromem-manager-test-") {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), prefix));

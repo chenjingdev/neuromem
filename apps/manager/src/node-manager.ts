@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LocalCodexProvider, type CodexProvider, type CodexSessionStatus } from "./codex-provider.js";
 import { ComposeController, readNodeEnv } from "./compose.js";
 import { assertUuid, assertUuid7, atomicWrite, ensurePrivateDirectory, exists, readJson, safeLabel, sha256File } from "./fs-safe.js";
 import { nodeDirectory, nodeFile, type ManagerPaths } from "./paths.js";
@@ -10,7 +11,7 @@ import { StateStore } from "./state.js";
 import { readManagerRuntimeConfig } from "./runtime-config.js";
 import type {
   BackupManifest, CommandRunner, DatabaseManifest, MigrationPlan, NodePhase, NodeRecord, NodeStatus,
-  OperationKind, OperationRecord, RestorePlan,
+  NodeModelStatus, ModelProviderState, OperationKind, OperationRecord, RestorePlan,
 } from "./types.js";
 
 export interface CreateNodeInput {
@@ -28,21 +29,110 @@ export interface NodeManagerOptions {
   startTimeoutMs?: number;
   managerPort?: number;
   imageContextRoot?: string;
+  codex?: CodexProvider;
+  codexBinary?: string;
 }
+
+export type GenerationSource = "codex_session" | "openai_compatible";
 
 export interface ModelConfiguration {
   embedding_base_url?: string;
   embedding_api_key?: string;
   embedding_model?: string;
+  embedding_send_dimensions?: boolean;
   generation_base_url?: string;
   generation_api_key?: string;
   generation_model?: string;
+  generation_source?: GenerationSource;
+  generation_direct_base_url?: string;
+  generation_direct_api_key?: string;
+  generation_direct_model?: string;
 }
+
+export interface ModelSelectionInput {
+  embedding_model?: string;
+  generation_model?: string;
+  generation?: GenerationSelectionInput;
+}
+
+export interface GenerationConnectionInput {
+  base_url: string;
+  api_key_action: "keep" | "replace" | "clear";
+  api_key?: string;
+}
+
+export interface GenerationSelectionInput {
+  source: GenerationSource;
+  model: string;
+  connection?: GenerationConnectionInput;
+}
+
+export interface GenerationProbeInput {
+  source: GenerationSource;
+  model?: string;
+  connection?: GenerationConnectionInput;
+}
+
+export interface ModelSelectionOption {
+  model: string | null;
+  available_models: string[];
+  diagnostic: string | null;
+}
+
+export interface ModelSelectionSnapshot {
+  node_id: string;
+  embedding: ModelSelectionOption;
+  generation: ModelSelectionOption & {
+    active_source: GenerationSource | null;
+    sources: {
+      codex_session: CodexSessionStatus;
+      openai_compatible: {
+        configured: boolean;
+        connection_origin: "generation" | "embedding_fallback" | null;
+        display_base_url: string | null;
+        api_key_configured: boolean;
+        model: string | null;
+        available_models: string[];
+        diagnostic: string | null;
+        last_checked_at: string;
+      };
+    };
+  };
+}
+
+interface ModelProvider {
+  base_url: string;
+  api_key: string;
+}
+
+interface ModelCatalog {
+  models: string[];
+  diagnostic: string | null;
+}
+
+interface ModelCompatibilityChecks {
+  embedding?: { provider: ModelProvider; model: string };
+  generation?: { source: GenerationSource; provider?: ModelProvider; model: string };
+}
+
+class EmbeddingProbeError extends Error {}
+class GenerationProbeError extends Error {}
 
 const ALIAS_PORTS: Record<string, NodeRecord["ports"]> = {
   personal: { api: 18001, dashboard: 14173, mcp: 18765 },
   company: { api: 28001, dashboard: 24173, mcp: 28765 },
 };
+
+interface CoreModelHealth {
+  embedding_configured?: boolean;
+  extraction_configured?: boolean;
+  embedding_provider_status?: string;
+  extraction_provider_status?: string;
+  embedding_provider_detail?: unknown;
+  extraction_provider_detail?: unknown;
+  embedding_last_probe_at?: unknown;
+  extraction_last_probe_at?: unknown;
+}
 
 export class NodeManager {
   readonly store: StateStore;
@@ -52,6 +142,7 @@ export class NodeManager {
   private readonly fetcher: typeof fetch;
   private readonly startTimeoutMs: number;
   private readonly imageContextRoot: string;
+  private readonly codex: CodexProvider;
 
   constructor(options: NodeManagerOptions) {
     this.paths = options.paths;
@@ -61,12 +152,18 @@ export class NodeManager {
     this.startTimeoutMs = options.startTimeoutMs ?? 180_000;
     this.managerPort = options.managerPort ?? Number(process.env.NEUROMEM_MANAGER_PORT || 14174);
     this.imageContextRoot = path.resolve(options.imageContextRoot || process.env.NEUROMEM_IMAGE_CONTEXT_ROOT || fileURLToPath(new URL("../../assets/images", import.meta.url)));
+    this.codex = options.codex || new LocalCodexProvider({ paths: options.paths, binary: options.codexBinary });
+  }
+
+  async close(): Promise<void> {
+    await this.codex.close();
   }
 
   async initialize(recoverInterrupted = false): Promise<void> {
     await this.store.initialize();
     if (recoverInterrupted) {
       await this.store.recoverInterruptedOperations();
+      await this.reconcileInterruptedModelConfigurations();
       await this.reconcileInterruptedCutovers();
     }
   }
@@ -131,19 +228,22 @@ export class NodeManager {
     if (!dockerAvailable) {
       const phase = node.desired_state === "stopped" ? "stopped" : "failed";
       const synchronized = node.phase === phase ? node : await this.store.updateNode(node.node_id, value => { value.phase = phase; });
+      const models = await this.configuredModels(node).catch(() => undefined);
       return {
         node: synchronized,
         docker_available: false,
         phase,
         components: [],
         endpoints,
+        ...(models ? { models } : {}),
         error: "Docker engine is unavailable",
       };
     }
     const components = await this.compose.ps(node);
     if (node.desired_state === "stopped" && components.every(component => !isRunning(component.state))) {
       const synchronized = node.phase === "stopped" ? node : await this.store.updateNode(node.node_id, value => { value.phase = "stopped"; });
-      return { node: synchronized, docker_available: true, phase: "stopped", components, endpoints };
+      const models = await this.configuredModels(node).catch(() => undefined);
+      return { node: synchronized, docker_available: true, phase: "stopped", components, endpoints, ...(models ? { models } : {}) };
     }
     const readiness = await this.probeReady(`${endpoints.api}/ready`, node);
     const expected = ["database", "core", "worker", "mcp", "web"];
@@ -161,7 +261,14 @@ export class NodeManager {
       if (!schema.ok && /schema|revision|expected|extension missing|table missing|halfvec/i.test(detail)) phase = "maintenance";
     }
     const synchronized = node.phase === phase ? node : await this.store.updateNode(node.node_id, value => { value.phase = phase; });
-    return { node: synchronized, docker_available: true, phase, components, endpoints };
+    return {
+      node: synchronized,
+      docker_available: true,
+      phase,
+      components,
+      endpoints,
+      ...(readiness.models ? { models: readiness.models } : {}),
+    };
   }
 
   async backlog(selector: string): Promise<Record<string, unknown>> {
@@ -545,35 +652,151 @@ export class NodeManager {
     const updates = modelEnvUpdates(configuration);
     if (!Object.keys(updates).length) throw new Error("At least one model setting is required");
     return this.store.withNodeLock(node.node_id, async () => {
-      let operation = await this.store.beginOperation(node.node_id, "models_configure", "updating_runtime");
-      const target = nodeFile(this.paths, node.node_id, ".env");
-      const original = await fs.readFile(target, "utf8");
-      try {
-        await atomicWrite(target, replaceEnvValues(original, updates));
-        let status: NodeStatus | null = null;
-        if (node.desired_state === "running") {
-          await this.compose.stop(node);
-          await this.compose.up(node);
-          status = await this.waitForReady(node.node_id);
-          if (status.phase !== "ready" && status.phase !== "degraded") throw new Error(`Node did not become operational after model configuration: ${status.phase}`);
-          await this.store.updateNode(node.node_id, value => { value.phase = status!.phase; });
-        }
-        operation = await this.store.updateOperation(operation, {
-          state: "succeeded",
-          phase: status?.phase || "configured",
-          completed_at: new Date().toISOString(),
-          result: { updated_fields: Object.keys(updates), restarted: node.desired_state === "running", status },
-        });
-        return operation;
-      } catch (error) {
-        await atomicWrite(target, original);
-        if (node.desired_state === "running") {
-          await this.compose.stop(node).catch(() => undefined);
-          await this.compose.up(node).catch(() => undefined);
-        }
-        return this.failOperation(operation, error);
-      }
+      const latest = await this.store.findNode(node.node_id);
+      return this.configureModelsLocked(latest, configuration, updates);
     });
+  }
+
+  async modelSelection(selector: string): Promise<ModelSelectionSnapshot> {
+    const node = await this.store.findNode(selector);
+    const env = await readNodeEnv(this.paths, node);
+    return { node_id: node.node_id, ...(await this.discoverModelSelection(node, env)).snapshot };
+  }
+
+  async generationProbe(selector: string, input: unknown): Promise<Record<string, unknown>> {
+    const probe = validateGenerationProbeInput(input);
+    const node = await this.store.findNode(selector);
+    const env = await readNodeEnv(this.paths, node);
+    if (probe.source === "codex_session") {
+      const status = await this.codex.sessionStatus();
+      if (status.auth_status !== "signed_in") throw new Error("Codex is not signed in with ChatGPT");
+      if (probe.model && !status.available_models.includes(probe.model)) throw new Error("Selected Codex model is unavailable");
+      if (probe.model) await this.probeCodexCompatibility(probe.model);
+      return {
+        source: probe.source,
+        available_models: status.available_models,
+        model_compatible: Boolean(probe.model),
+        diagnostic: null,
+        codex: status,
+      };
+    }
+    const resolved = directGenerationProvider(node, env, probe.connection);
+    const catalog = await this.discoverProviderModels(resolved.provider);
+    const available = roleCatalog(catalog, "generation");
+    if (probe.model) await this.probeGenerationCompatibility(resolved.provider, probe.model);
+    return {
+      source: probe.source,
+      available_models: available.available_models,
+      model_compatible: Boolean(probe.model),
+      diagnostic: available.diagnostic,
+      display_base_url: displayProviderUrl(resolved.provider.base_url),
+      api_key_configured: Boolean(resolved.provider.api_key),
+    };
+  }
+
+  async selectModels(selector: string, input: unknown): Promise<OperationRecord> {
+    const selection = validateModelSelectionInput(input);
+    const node = await this.store.findNode(selector);
+    return this.store.withNodeLock(node.node_id, async () => {
+      const latest = await this.store.findNode(node.node_id);
+      const env = await readNodeEnv(this.paths, latest);
+      const discovered = await this.discoverModelSelection(latest, env);
+      const configuration: ModelConfiguration = {};
+      const compatibility: ModelCompatibilityChecks = {};
+
+      if (selection.embedding_model !== undefined && selection.embedding_model !== env.EMBEDDING_MODEL) {
+        if (!discovered.snapshot.embedding.available_models.includes(selection.embedding_model)) {
+          throw new Error("Selected embedding model is not available from the configured provider");
+        }
+        if (!discovered.embedding_provider) throw new Error("Embedding model provider is not configured");
+        compatibility.embedding = { provider: discovered.embedding_provider, model: selection.embedding_model };
+        configuration.embedding_model = selection.embedding_model;
+        // Neuromem stores fixed 2560-dimensional vectors. OpenAI-compatible
+        // providers such as Ollama can project larger embedding models when the
+        // dimensions request field is sent.
+        configuration.embedding_send_dimensions = true;
+        if (!env.EMBEDDING_BASE_URL) {
+          configuration.embedding_base_url = discovered.embedding_provider.base_url;
+          configuration.embedding_api_key = discovered.embedding_provider.api_key;
+        }
+      }
+
+      if (selection.generation) {
+        const requested = selection.generation;
+        if (requested.source === "codex_session") {
+          const status = discovered.snapshot.generation.sources.codex_session;
+          if (status.auth_status !== "signed_in") throw new Error("Codex is not signed in with ChatGPT");
+          if (!status.available_models.includes(requested.model)) throw new Error("Selected Codex model is unavailable");
+          preserveDirectGenerationConfiguration(configuration, latest, env);
+          configuration.generation_source = "codex_session";
+          configuration.generation_base_url = codexBridgeBaseUrl(this.managerPort, latest.node_id);
+          configuration.generation_api_key = env.API_TOKEN || "";
+          configuration.generation_model = requested.model;
+          compatibility.generation = { source: "codex_session", model: requested.model };
+        } else {
+          const resolved = directGenerationProvider(latest, env, requested.connection);
+          const catalog = await this.discoverProviderModels(resolved.provider);
+          const available = roleCatalog(catalog, "generation").available_models;
+          if (available.length && !available.includes(requested.model)) {
+            throw new Error("Selected generation model is not available from the configured provider");
+          }
+          configuration.generation_source = "openai_compatible";
+          configuration.generation_base_url = resolved.provider.base_url;
+          configuration.generation_api_key = resolved.provider.api_key;
+          configuration.generation_model = requested.model;
+          configuration.generation_direct_base_url = resolved.provider.base_url;
+          configuration.generation_direct_api_key = resolved.provider.api_key;
+          configuration.generation_direct_model = requested.model;
+          compatibility.generation = { source: "openai_compatible", provider: resolved.provider, model: requested.model };
+        }
+      } else if (selection.generation_model !== undefined && selection.generation_model !== env.GENERATION_MODEL) {
+        if (!discovered.snapshot.generation.available_models.includes(selection.generation_model)) {
+          throw new Error("Selected generation model is not available from the configured provider");
+        }
+        if (!discovered.generation_provider) throw new Error("Generation model provider is not configured");
+        compatibility.generation = {
+          source: generationSource(latest, env) || "openai_compatible",
+          provider: discovered.generation_provider,
+          model: selection.generation_model,
+        };
+        configuration.generation_model = selection.generation_model;
+        if (!env.GENERATION_BASE_URL) {
+          configuration.generation_base_url = discovered.generation_provider.base_url;
+          configuration.generation_api_key = discovered.generation_provider.api_key;
+        }
+      }
+
+      const updates = modelEnvUpdates(configuration);
+      if (!Object.keys(updates).length) throw new Error("At least one model selection must change");
+      return this.configureModelsLocked(latest, configuration, updates, compatibility);
+    });
+  }
+
+  async codexBridgeModels(selector: string, authorization: string | undefined): Promise<Record<string, unknown>> {
+    const { node, env } = await this.authorizeCodexBridge(selector, authorization);
+    if (generationSource(node, env) !== "codex_session") throw new Error("Codex generation is not active for this Node");
+    const status = await this.codex.sessionStatus();
+    if (status.auth_status !== "signed_in") throw new Error("Codex is not signed in with ChatGPT");
+    return { object: "list", data: status.available_models.map(id => ({ id, object: "model", owned_by: "codex" })) };
+  }
+
+  async codexChatCompletion(selector: string, authorization: string | undefined, input: unknown): Promise<Record<string, unknown>> {
+    const { node, env } = await this.authorizeCodexBridge(selector, authorization);
+    if (generationSource(node, env) !== "codex_session") throw new Error("Codex generation is not active for this Node");
+    const request = validateCodexChatCompletion(input);
+    if (request.model !== env.GENERATION_MODEL) throw new Error("Requested model does not match the configured Codex model");
+    const content = await this.codex.generateJson({
+      model: request.model,
+      messages: request.messages,
+      output_schema: request.output_schema,
+    });
+    return {
+      id: `chatcmpl-${crypto.randomUUID()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: request.model,
+      choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    };
   }
 
   async deleteNode(selector: string, confirmation: string, purgeData: boolean): Promise<OperationRecord> {
@@ -736,9 +959,14 @@ export class NodeManager {
         EMBEDDING_API_KEY: runtime.EMBEDDING_API_KEY || process.env.EMBEDDING_API_KEY || "",
         EMBEDDING_MODEL: runtime.EMBEDDING_MODEL || process.env.EMBEDDING_MODEL || "qwen3-embedding:4b",
         EMBEDDING_DIMENSIONS: runtime.EMBEDDING_DIMENSIONS || process.env.EMBEDDING_DIMENSIONS || "2560",
+        EMBEDDING_SEND_DIMENSIONS: runtime.EMBEDDING_SEND_DIMENSIONS || process.env.EMBEDDING_SEND_DIMENSIONS || "false",
         GENERATION_BASE_URL: runtime.GENERATION_BASE_URL || process.env.GENERATION_BASE_URL || "",
         GENERATION_API_KEY: runtime.GENERATION_API_KEY || process.env.GENERATION_API_KEY || "",
         GENERATION_MODEL: runtime.GENERATION_MODEL || process.env.GENERATION_MODEL || "",
+        GENERATION_SOURCE: runtime.GENERATION_BASE_URL || process.env.GENERATION_BASE_URL ? "openai_compatible" : "",
+        GENERATION_DIRECT_BASE_URL: runtime.GENERATION_BASE_URL || process.env.GENERATION_BASE_URL || "",
+        GENERATION_DIRECT_API_KEY: runtime.GENERATION_API_KEY || process.env.GENERATION_API_KEY || "",
+        GENERATION_DIRECT_MODEL: runtime.GENERATION_MODEL || process.env.GENERATION_MODEL || "",
       };
       await atomicWrite(envTarget, `${Object.entries(values).map(([key, value]) => `${key}=${escapeEnv(String(value))}`).join("\n")}\n`);
     }
@@ -817,9 +1045,316 @@ export class NodeManager {
     return response.ok;
   }
 
-  private async probeReady(url: string, node: NodeRecord): Promise<{ operational: boolean; fully_ready: boolean }> {
+  private async configuredModels(node: NodeRecord): Promise<NodeModelStatus> {
+    return modelStatusFrom(await readNodeEnv(this.paths, node));
+  }
+
+  private async configureModelsLocked(
+    node: NodeRecord,
+    configuration: ModelConfiguration,
+    updates: Record<string, string>,
+    compatibility: ModelCompatibilityChecks = {},
+  ): Promise<OperationRecord> {
+    let operation = await this.store.beginOperation(node.node_id, "models_configure", "updating_runtime");
+    const target = nodeFile(this.paths, node.node_id, ".env");
+    const original = await fs.readFile(target, "utf8");
+    const env = await readNodeEnv(this.paths, node);
+    const embeddingChanged = configuration.embedding_model !== undefined && configuration.embedding_model !== env.EMBEDDING_MODEL;
+    const composeTarget = nodeFile(this.paths, node.node_id, "compose.yaml");
+    const originalCompose = Object.hasOwn(updates, "EMBEDDING_SEND_DIMENSIONS")
+      ? await fs.readFile(composeTarget, "utf8")
+      : null;
     try {
-      const env = await readNodeEnv(this.paths, node);
+      if (embeddingChanged) {
+        if (node.desired_state !== "running") {
+          throw new Error("Changing the embedding model on a stopped Node is blocked because existing model-bound data cannot be verified");
+        }
+        operation = await this.store.updateOperation(operation, { phase: "quiescing_model_writers" });
+        await this.compose.stopWriters(node);
+        operation = await this.store.updateOperation(operation, { phase: "verifying_empty_node" });
+        let manifest: DatabaseManifest;
+        try {
+          manifest = await this.compose.databaseManifest(node);
+        } catch {
+          throw new Error("Changing the embedding model is blocked because existing model-bound data could not be verified");
+        }
+        const modelBoundRows = ["records", "claims", "jobs", "embedding_profiles", "record_embeddings", "claim_embeddings"]
+          .reduce((sum, table) => sum + Number(manifest.row_counts[table] || 0), 0);
+        if (modelBoundRows > 0) {
+          throw new Error("Changing the embedding model requires an empty Node until a re-embedding migration is supported");
+        }
+      }
+      if (compatibility.embedding) {
+        operation = await this.store.updateOperation(operation, { phase: "probing_embedding_model" });
+        await this.probeEmbeddingCompatibility(compatibility.embedding.provider, compatibility.embedding.model);
+      }
+      if (compatibility.generation) {
+        operation = await this.store.updateOperation(operation, { phase: "probing_generation_model" });
+        if (compatibility.generation.source === "codex_session") {
+          await this.probeCodexCompatibility(compatibility.generation.model);
+        } else {
+          if (!compatibility.generation.provider) throw new Error("Generation model provider is not configured");
+          await this.probeGenerationCompatibility(compatibility.generation.provider, compatibility.generation.model);
+        }
+      }
+      if (originalCompose !== null) await atomicWrite(composeTarget, ensureEmbeddingDimensionsCompose(originalCompose));
+      await atomicWrite(target, replaceEnvValues(original, updates));
+      let status: NodeStatus | null = null;
+      if (node.desired_state === "running") {
+        await this.compose.stop(node);
+        await this.compose.up(node);
+        status = await this.waitForReady(node.node_id);
+        if (status.phase !== "ready" && status.phase !== "degraded") throw new Error(`Node did not become operational after model configuration: ${status.phase}`);
+        await this.store.updateNode(node.node_id, value => { value.phase = status!.phase; });
+      }
+      operation = await this.store.updateOperation(operation, {
+        state: "succeeded",
+        phase: status?.phase || "configured",
+        completed_at: new Date().toISOString(),
+        result: { updated_fields: Object.keys(updates), restarted: node.desired_state === "running", status },
+      });
+      return operation;
+    } catch (error) {
+      let rollbackFailed = false;
+      try {
+        await atomicWrite(target, original);
+        if (originalCompose !== null) await atomicWrite(composeTarget, originalCompose);
+      } catch {
+        rollbackFailed = true;
+      }
+      if (node.desired_state === "running") {
+        try {
+          await this.compose.stop(node);
+          await this.compose.up(node);
+          const recovered = await this.waitForReady(node.node_id);
+          if (recovered.phase !== "ready" && recovered.phase !== "degraded") throw new Error("rollback recovery did not become operational");
+          await this.store.updateNode(node.node_id, value => { value.phase = recovered.phase; });
+        } catch {
+          rollbackFailed = true;
+        }
+      }
+      if (rollbackFailed) {
+        await this.store.updateNode(node.node_id, value => { value.phase = "failed"; }).catch(() => undefined);
+        const message = (error as Error).message || String(error);
+        return this.failOperation(operation, new Error(`${message}; rollback recovery failed`));
+      }
+      return this.failOperation(operation, error);
+    }
+  }
+
+  private async probeEmbeddingCompatibility(provider: ModelProvider, model: string): Promise<void> {
+    let target: URL;
+    try {
+      target = providerEndpoint(provider.base_url, "embeddings");
+    } catch {
+      throw new Error("Configured embedding provider URL is invalid");
+    }
+    try {
+      const headers: Record<string, string> = { accept: "application/json", "content-type": "application/json" };
+      if (provider.api_key) headers.authorization = `Bearer ${provider.api_key}`;
+      const response = await this.fetcher(target, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model, input: ["Neuromem compatibility probe"], dimensions: 2560, encoding_format: "float" }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!response.ok) throw new EmbeddingProbeError(`Selected embedding model failed the 2560-dimension compatibility probe (HTTP ${response.status})`);
+      const payload = await response.json().catch(() => null) as { data?: Array<{ embedding?: unknown }> } | null;
+      const embedding = payload?.data?.[0]?.embedding;
+      if (!Array.isArray(embedding)) throw new EmbeddingProbeError("Selected embedding model returned an invalid compatibility probe response");
+      if (embedding.length !== 2560) {
+        throw new EmbeddingProbeError(`Selected embedding model returned ${embedding.length} dimensions; Neuromem requires 2560`);
+      }
+      if (!embedding.every(value => typeof value === "number" && Number.isFinite(value))) {
+        throw new EmbeddingProbeError("Selected embedding model returned invalid vector values during the compatibility probe");
+      }
+      const norm = Math.sqrt(embedding.reduce((sum: number, value) => sum + (value as number) * (value as number), 0));
+      if (!Number.isFinite(norm) || norm === 0) {
+        throw new EmbeddingProbeError("Selected embedding model returned an invalid vector norm during the compatibility probe");
+      }
+    } catch (error) {
+      if (error instanceof EmbeddingProbeError) throw error;
+      throw new Error("Could not complete the selected embedding model compatibility probe");
+    }
+  }
+
+  private async probeGenerationCompatibility(provider: ModelProvider, model: string): Promise<void> {
+    let target: URL;
+    try {
+      target = providerEndpoint(provider.base_url, "chat/completions");
+    } catch {
+      throw new Error("Configured generation provider URL is invalid");
+    }
+    try {
+      const headers: Record<string, string> = { accept: "application/json", "content-type": "application/json" };
+      if (provider.api_key) headers.authorization = `Bearer ${provider.api_key}`;
+      const response = await this.fetcher(target, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "Return one JSON object with an ok field." }],
+          response_format: { type: "json_object" },
+          temperature: 0,
+          max_tokens: 32,
+        }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!response.ok) throw new GenerationProbeError(`Selected generation model failed the JSON chat compatibility probe (HTTP ${response.status})`);
+      const payload = await response.json().catch(() => null) as { choices?: Array<{ message?: { content?: unknown } }> } | null;
+      const content = payload?.choices?.[0]?.message?.content;
+      if (typeof content !== "string") throw new GenerationProbeError("Selected generation model returned an invalid chat compatibility response");
+      const parsed = JSON.parse(content) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new GenerationProbeError("Selected generation model did not return a JSON object");
+      }
+    } catch (error) {
+      if (error instanceof GenerationProbeError) throw error;
+      throw new Error("Could not complete the selected generation model compatibility probe");
+    }
+  }
+
+  private async probeCodexCompatibility(model: string): Promise<void> {
+    const status = await this.codex.sessionStatus();
+    if (status.auth_status !== "signed_in") throw new Error("Codex is not signed in with ChatGPT");
+    if (!status.available_models.includes(model)) throw new Error("Selected Codex model is unavailable");
+    const content = await this.codex.generateJson({
+      model,
+      messages: [{ role: "user", content: "Return one JSON object whose ok field is true. Do not use tools." }],
+      output_schema: {
+        type: "object",
+        properties: { ok: { type: "boolean", const: true } },
+        required: ["ok"],
+        additionalProperties: false,
+      },
+    });
+    const parsed = JSON.parse(content) as { ok?: unknown };
+    if (parsed.ok !== true) throw new Error("Selected Codex model failed the JSON compatibility probe");
+  }
+
+  private async authorizeCodexBridge(
+    selector: string,
+    authorization: string | undefined,
+  ): Promise<{ node: NodeRecord; env: Record<string, string> }> {
+    const node = await this.store.findNode(selector);
+    const env = await readNodeEnv(this.paths, node);
+    const provided = String(authorization || "").match(/^Bearer\s+(.+)$/i)?.[1] || "";
+    const expected = env.API_TOKEN || "";
+    const left = Buffer.from(provided);
+    const right = Buffer.from(expected);
+    if (!provided || !expected || left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+      throw new Error("Invalid Node bridge authorization");
+    }
+    return { node, env };
+  }
+
+  private async discoverModelSelection(node: NodeRecord, env: Record<string, string>): Promise<{
+    snapshot: Omit<ModelSelectionSnapshot, "node_id">;
+    embedding_provider: ModelProvider | null;
+    generation_provider: ModelProvider | null;
+  }> {
+    const activeSource = generationSource(node, env);
+    const configuredEmbedding = modelProvider(env.EMBEDDING_BASE_URL, env.EMBEDDING_API_KEY);
+    const direct = savedDirectGenerationProvider(node, env);
+    const embeddingProvider = configuredEmbedding || (activeSource === "openai_compatible" ? direct.provider : null);
+    const generationProvider = activeSource === "codex_session"
+      ? modelProvider(codexBridgeBaseUrl(this.managerPort, node.node_id), env.API_TOKEN)
+      : direct.provider;
+    const catalogs = new Map<string, Promise<ModelCatalog>>();
+    const discover = (provider: ModelProvider | null): Promise<ModelCatalog> => {
+      if (!provider) return Promise.resolve({ models: [], diagnostic: "Model provider is not configured" });
+      const key = `${provider.base_url}\0${provider.api_key}`;
+      const existing = catalogs.get(key);
+      if (existing) return existing;
+      const pending = this.discoverProviderModels(provider);
+      catalogs.set(key, pending);
+      return pending;
+    };
+    const [embeddingCatalog, directGenerationCatalog, codexStatus] = await Promise.all([
+      discover(embeddingProvider),
+      discover(direct.provider),
+      this.codex.sessionStatus(),
+    ]);
+    const secrets = providerSensitiveValues(env);
+    const directSelection = roleCatalog(directGenerationCatalog, "generation");
+    const activeGeneration = activeSource === "codex_session"
+      ? {
+          available_models: codexStatus.available_models,
+          diagnostic: codexStatus.auth_status === "signed_in" ? null : codexStatus.diagnostic,
+        }
+      : directSelection;
+    return {
+      snapshot: {
+        embedding: {
+          model: safeModelName(env.EMBEDDING_MODEL, secrets) || null,
+          ...roleCatalog(embeddingCatalog, "embedding"),
+        },
+        generation: {
+          model: safeModelName(env.GENERATION_MODEL, secrets) || null,
+          ...activeGeneration,
+          active_source: activeSource,
+          sources: {
+            codex_session: codexStatus,
+            openai_compatible: {
+              configured: Boolean(direct.provider),
+              connection_origin: direct.origin,
+              display_base_url: direct.provider ? displayProviderUrl(direct.provider.base_url) : null,
+              api_key_configured: Boolean(direct.provider?.api_key),
+              model: safeModelName(direct.model || undefined, secrets) || null,
+              available_models: directSelection.available_models,
+              diagnostic: directSelection.diagnostic,
+              last_checked_at: new Date().toISOString(),
+            },
+          },
+        },
+      },
+      embedding_provider: embeddingProvider,
+      generation_provider: generationProvider,
+    };
+  }
+
+  private async discoverProviderModels(provider: ModelProvider): Promise<ModelCatalog> {
+    let target: URL;
+    try {
+      target = providerEndpoint(provider.base_url, "models");
+    } catch {
+      return { models: [], diagnostic: "Configured model provider URL is invalid" };
+    }
+    try {
+      const headers: Record<string, string> = { accept: "application/json" };
+      if (provider.api_key) headers.authorization = `Bearer ${provider.api_key}`;
+      const response = await this.fetcher(target, { headers, signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) return { models: [], diagnostic: `Model provider returned HTTP ${response.status}` };
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > 1024 * 1024) return { models: [], diagnostic: "Model provider returned an oversized model catalog" };
+      const payload = await response.json().catch(() => null) as { data?: unknown } | null;
+      if (!payload || !Array.isArray(payload.data)) {
+        return { models: [], diagnostic: "Model provider returned an invalid model catalog" };
+      }
+      if (payload.data.length > 1_000) return { models: [], diagnostic: "Model provider returned an oversized model catalog" };
+      const models = new Set<string>();
+      let totalIdLength = 0;
+      for (const entry of payload.data) {
+        if (!entry || typeof entry !== "object" || !("id" in entry)) continue;
+        const id = (entry as { id?: unknown }).id;
+        if (typeof id !== "string") continue;
+        totalIdLength += id.length;
+        if (totalIdLength > 64 * 1024) return { models: [], diagnostic: "Model provider returned an oversized model catalog" };
+        if (validModelName(id) && !modelNameLeaksProvider(id, provider)) models.add(id);
+      }
+      return { models: [...models].sort((left, right) => left.localeCompare(right)), diagnostic: null };
+    } catch {
+      return { models: [], diagnostic: "Could not reach the configured model provider" };
+    }
+  }
+
+  private async probeReady(
+    url: string,
+    node: NodeRecord,
+  ): Promise<{ operational: boolean; fully_ready: boolean; models?: NodeModelStatus }> {
+    let env: Record<string, string> | undefined;
+    try {
+      env = await readNodeEnv(this.paths, node);
       const response = await this.fetcher(url, {
         headers: { authorization: `Bearer ${env.API_TOKEN || ""}` },
         signal: AbortSignal.timeout(3_000),
@@ -827,6 +1362,8 @@ export class NodeManager {
       const payload = await response.json().catch(() => ({})) as {
         status?: string; database?: boolean; embedding_configured?: boolean; extraction_configured?: boolean;
         embedding_provider_status?: string; extraction_provider_status?: string;
+        embedding_provider_detail?: unknown; extraction_provider_detail?: unknown;
+        embedding_last_probe_at?: unknown; extraction_last_probe_at?: unknown;
       };
       const operational = response.ok && payload.database !== false;
       const fullyReady = operational
@@ -835,9 +1372,13 @@ export class NodeManager {
         && payload.extraction_configured !== false
         && (payload.embedding_provider_status === undefined || ["ready", "configured"].includes(payload.embedding_provider_status))
         && (payload.extraction_provider_status === undefined || ["ready", "configured"].includes(payload.extraction_provider_status));
-      return { operational, fully_ready: fullyReady };
+      return { operational, fully_ready: fullyReady, models: modelStatusFrom(env, payload) };
     } catch {
-      return { operational: false, fully_ready: false };
+      return {
+        operational: false,
+        fully_ready: false,
+        ...(env ? { models: modelStatusFrom(env) } : {}),
+      };
     }
   }
 
@@ -1046,6 +1587,63 @@ export class NodeManager {
     }
   }
 
+  private async reconcileInterruptedModelConfigurations(): Promise<void> {
+    const retryablePhases = new Set(["manager_restarted", "model_recovery_restarting", "model_recovery_failed"]);
+    for (const node of await this.listNodes()) {
+      const interrupted = (await this.store.operations(node.node_id)).reverse().find(operation => (
+        operation.kind === "models_configure"
+        && operation.state === "needs_attention"
+        && retryablePhases.has(operation.phase)
+      ));
+      if (!interrupted) continue;
+      await this.store.withNodeLock(node.node_id, async () => {
+        const latest = await this.store.findNode(node.node_id);
+        let recovering = await this.store.updateOperation(interrupted, {
+          state: "needs_attention",
+          phase: "model_recovery_restarting",
+          completed_at: undefined,
+          error: "The Node Manager is synchronizing the runtime with the saved model configuration",
+        });
+        try {
+          await readNodeEnv(this.paths, latest);
+          if (latest.desired_state === "stopped") {
+            await this.store.updateNode(latest.node_id, value => { value.phase = "stopped"; });
+            await this.store.updateOperation(recovering, {
+              state: "recovered",
+              phase: "model_configuration_saved_for_next_start",
+              completed_at: new Date().toISOString(),
+              error: undefined,
+              result: modelRecoveryResult(recovering.result, false),
+            });
+            return;
+          }
+          await this.compose.stop(latest);
+          await this.compose.up(latest);
+          const status = await this.waitForReady(latest.node_id);
+          if (status.phase !== "ready" && status.phase !== "degraded") {
+            throw new Error("Recovered model runtime did not become operational");
+          }
+          await this.store.updateNode(latest.node_id, value => { value.phase = status.phase; });
+          recovering = await this.store.updateOperation(recovering, {
+            state: "recovered",
+            phase: "model_runtime_synced_after_manager_restart",
+            completed_at: new Date().toISOString(),
+            error: undefined,
+            result: modelRecoveryResult(recovering.result, true),
+          });
+        } catch {
+          await this.store.updateNode(latest.node_id, value => { value.phase = "failed"; }).catch(() => undefined);
+          await this.store.updateOperation(recovering, {
+            state: "needs_attention",
+            phase: "model_recovery_failed",
+            completed_at: new Date().toISOString(),
+            error: "Model configuration recovery failed; restart the Node Manager to retry",
+          });
+        }
+      });
+    }
+  }
+
   private async cutover(
     node: NodeRecord,
     candidateVolume: string,
@@ -1132,9 +1730,80 @@ function escapeEnv(value: string): string {
   return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }
 
+function modelStatusFrom(env: Record<string, string>, payload: CoreModelHealth = {}): NodeModelStatus {
+  const secrets = providerSensitiveValues(env);
+  const embeddingConfigured = typeof payload.embedding_configured === "boolean"
+    ? payload.embedding_configured
+    : Boolean(env.EMBEDDING_BASE_URL && env.EMBEDDING_MODEL);
+  const extractionConfigured = typeof payload.extraction_configured === "boolean"
+    ? payload.extraction_configured
+    : Boolean(env.GENERATION_BASE_URL && env.GENERATION_MODEL);
+  const embeddingModel = safeModelName(env.EMBEDDING_MODEL, secrets);
+  const extractionModel = safeModelName(env.GENERATION_MODEL, secrets);
+  return {
+    embedding: {
+      configured: embeddingConfigured,
+      ...(embeddingModel ? { model: embeddingModel } : {}),
+      provider_status: modelProviderState(payload.embedding_provider_status, embeddingConfigured),
+      provider_detail: providerDetail(payload.embedding_provider_detail, secrets),
+      last_probe_at: probeTimestamp(payload.embedding_last_probe_at),
+    },
+    extraction: {
+      configured: extractionConfigured,
+      ...(extractionModel ? { model: extractionModel } : {}),
+      provider_status: modelProviderState(payload.extraction_provider_status, extractionConfigured),
+      provider_detail: providerDetail(payload.extraction_provider_detail, secrets),
+      last_probe_at: probeTimestamp(payload.extraction_last_probe_at),
+    },
+  };
+}
+
+function modelProviderState(value: string | undefined, configured: boolean): ModelProviderState {
+  if (["unconfigured", "configured", "unknown", "ready", "error"].includes(value || "")) {
+    return value as ModelProviderState;
+  }
+  return configured ? "configured" : "unconfigured";
+}
+
+function providerDetail(value: unknown, secrets: string[]): string | null {
+  if (typeof value !== "string" || !value) return null;
+  let sanitized = redact(value);
+  for (const secret of secrets) sanitized = sanitized.replaceAll(secret, "[redacted]");
+  return sanitized.slice(0, 500);
+}
+
+function probeTimestamp(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 128 || /[\r\n\0]/.test(value)) return null;
+  return value;
+}
+
+function safeModelName(value: string | undefined, secrets: string[]): string | undefined {
+  const model = value?.trim();
+  if (!model || model.length > 512 || /[\r\n\0]/.test(model) || /^https?:\/\//i.test(model)) return undefined;
+  if (secrets.some(secret => sharesSensitiveFragment(model, secret))) return undefined;
+  return model;
+}
+
+function providerSensitiveValues(env: Record<string, string>): string[] {
+  const values = [
+    env.API_TOKEN, env.EMBEDDING_API_KEY, env.GENERATION_API_KEY, env.GENERATION_DIRECT_API_KEY,
+    env.EMBEDDING_BASE_URL, env.GENERATION_BASE_URL, env.GENERATION_DIRECT_BASE_URL,
+  ]
+    .filter((value): value is string => Boolean(value));
+  for (const baseUrl of [env.EMBEDDING_BASE_URL, env.GENERATION_BASE_URL, env.GENERATION_DIRECT_BASE_URL]) {
+    if (!baseUrl) continue;
+    try {
+      const parsed = new URL(baseUrl);
+      values.push(parsed.hostname);
+      if (parsed.hostname.toLowerCase() === "host.docker.internal") values.push("127.0.0.1");
+    } catch {}
+  }
+  return [...new Set(values)];
+}
+
 function redact(value: string): string {
   return value
-    .replace(/(POSTGRES_PASSWORD|API_TOKEN|MCP_TOKEN|EMBEDDING_API_KEY|GENERATION_API_KEY|CORE_TOKEN|authorization)(\s*[=:]\s*)[^\s,}]+/gi, "$1$2[redacted]")
+    .replace(/(POSTGRES_PASSWORD|API_TOKEN|MCP_TOKEN|EMBEDDING_API_KEY|GENERATION_API_KEY|GENERATION_DIRECT_API_KEY|CORE_TOKEN|authorization)(\s*[=:]\s*)[^\s,}]+/gi, "$1$2[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [redacted]")
     .replace(/(postgres(?:ql)?(?:\+[a-z0-9]+)?:\/\/[^:\s/]+:)[^@\s]+(@)/gi, "$1[redacted]$2");
 }
@@ -1172,34 +1841,322 @@ function replaceEnv(source: string, key: string, value: string): string {
   return source.replace(expression, `${key}=${escapeEnv(value)}`);
 }
 
+function ensureEmbeddingDimensionsCompose(source: string): string {
+  if (/^\s+NEUROMEM_EMBEDDING_SEND_DIMENSIONS:/m.test(source)) return source;
+  const marker = /^(\s+)NEUROMEM_EMBEDDING_DIMENSIONS:.*$/m;
+  if (!marker.test(source)) throw new Error("Runtime Compose is missing the embedding dimensions setting");
+  return source.replace(marker, line => `${line}\n${line.match(/^\s+/)?.[0] || "    "}NEUROMEM_EMBEDDING_SEND_DIMENSIONS: \${EMBEDDING_SEND_DIMENSIONS:-false}`);
+}
+
 function replaceEnvValues(source: string, values: Record<string, string>): string {
   let next = source;
-  for (const [key, value] of Object.entries(values)) next = replaceEnv(next, key, value);
+  for (const [key, value] of Object.entries(values)) {
+    if (!new RegExp(`^${key}=.*$`, "m").test(next)) {
+      next = `${next}${next.endsWith("\n") ? "" : "\n"}${key}=${escapeEnv(value)}\n`;
+      continue;
+    }
+    next = replaceEnv(next, key, value);
+  }
   return next;
 }
 
 function modelEnvUpdates(configuration: ModelConfiguration): Record<string, string> {
-  const mappings: Array<[keyof ModelConfiguration, string, "url" | "text"]> = [
+  const mappings: Array<[keyof ModelConfiguration, string, "url" | "text", boolean?]> = [
     ["embedding_base_url", "EMBEDDING_BASE_URL", "url"],
-    ["embedding_api_key", "EMBEDDING_API_KEY", "text"],
+    ["embedding_api_key", "EMBEDDING_API_KEY", "text", true],
     ["embedding_model", "EMBEDDING_MODEL", "text"],
     ["generation_base_url", "GENERATION_BASE_URL", "url"],
-    ["generation_api_key", "GENERATION_API_KEY", "text"],
+    ["generation_api_key", "GENERATION_API_KEY", "text", true],
     ["generation_model", "GENERATION_MODEL", "text"],
+    ["generation_direct_base_url", "GENERATION_DIRECT_BASE_URL", "url"],
+    ["generation_direct_api_key", "GENERATION_DIRECT_API_KEY", "text", true],
+    ["generation_direct_model", "GENERATION_DIRECT_MODEL", "text"],
   ];
   const updates: Record<string, string> = {};
-  for (const [input, output, kind] of mappings) {
+  for (const [input, output, kind, allowEmpty] of mappings) {
     const value = configuration[input];
     if (value === undefined) continue;
-    if (!value || /[\r\n\0]/.test(value)) throw new Error(`Invalid ${input}`);
+    if (typeof value !== "string" || (!allowEmpty && !value) || /[\r\n\0]/.test(value)) throw new Error(`Invalid ${input}`);
     if (kind === "url") {
-      let parsed: URL;
-      try { parsed = new URL(value); } catch { throw new Error(`${input} must be an HTTP(S) URL`); }
-      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error(`${input} must be an HTTP(S) URL without credentials`);
+      validatedProviderBaseUrl(value, String(input));
     }
     updates[output] = value;
   }
+  if (configuration.embedding_send_dimensions !== undefined) {
+    if (typeof configuration.embedding_send_dimensions !== "boolean") throw new Error("Invalid embedding_send_dimensions");
+    updates.EMBEDDING_SEND_DIMENSIONS = String(configuration.embedding_send_dimensions);
+  }
+  if (configuration.generation_source !== undefined) updates.GENERATION_SOURCE = configuration.generation_source;
   return updates;
+}
+
+function validateModelSelectionInput(value: unknown): ModelSelectionInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Model selection must be a JSON object");
+  const allowed = new Set(["embedding_model", "generation_model", "generation"]);
+  const keys = Object.keys(value);
+  if (keys.some(key => !allowed.has(key))) throw new Error("Unsupported model selection field");
+  const input = value as Record<string, unknown>;
+  const output: ModelSelectionInput = {};
+  for (const key of ["embedding_model", "generation_model"] as const) {
+    const selected = input[key];
+    if (selected === undefined) continue;
+    if (typeof selected !== "string" || !validModelName(selected)) throw new Error(`Invalid ${key}`);
+    output[key] = selected;
+  }
+  if (input.generation !== undefined) output.generation = validateGenerationSelection(input.generation);
+  if (output.generation && output.generation_model) throw new Error("generation and generation_model cannot be combined");
+  if (!Object.keys(output).length) throw new Error("At least one model selection is required");
+  return output;
+}
+
+function validateGenerationProbeInput(value: unknown): GenerationProbeInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Generation probe must be a JSON object");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !["source", "model", "connection"].includes(key))) throw new Error("Unsupported generation probe field");
+  const source = validateGenerationSource(input.source);
+  const model = input.model === undefined ? undefined : input.model;
+  if (model !== undefined && (typeof model !== "string" || !validModelName(model))) throw new Error("Invalid generation model");
+  if (source === "codex_session") {
+    if (input.connection !== undefined) throw new Error("Codex session probes cannot include API connection fields");
+    return { source, ...(model ? { model } : {}) };
+  }
+  return { source, ...(model ? { model } : {}), connection: validateGenerationConnection(input.connection) };
+}
+
+function validateGenerationSelection(value: unknown): GenerationSelectionInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Generation selection must be a JSON object");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !["source", "model", "connection"].includes(key))) throw new Error("Unsupported generation selection field");
+  const source = validateGenerationSource(input.source);
+  if (typeof input.model !== "string" || !validModelName(input.model)) throw new Error("Invalid generation model");
+  if (source === "codex_session") {
+    if (input.connection !== undefined) throw new Error("Codex session selection cannot include API connection fields");
+    return { source, model: input.model };
+  }
+  return { source, model: input.model, connection: validateGenerationConnection(input.connection) };
+}
+
+function validateGenerationSource(value: unknown): GenerationSource {
+  if (value !== "codex_session" && value !== "openai_compatible") throw new Error("Invalid generation source");
+  return value;
+}
+
+function validateGenerationConnection(value: unknown): GenerationConnectionInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("API connection settings are required");
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some(key => !["base_url", "api_key_action", "api_key"].includes(key))) throw new Error("Unsupported API connection field");
+  if (typeof input.base_url !== "string") throw new Error("API base URL is required");
+  const baseUrl = validatedProviderBaseUrl(input.base_url);
+  if (!(["keep", "replace", "clear"] as unknown[]).includes(input.api_key_action)) throw new Error("Invalid API key action");
+  const action = input.api_key_action as GenerationConnectionInput["api_key_action"];
+  if (action === "replace") {
+    if (typeof input.api_key !== "string" || !input.api_key || input.api_key.length > 8192 || /[\r\n\0]/.test(input.api_key)) {
+      throw new Error("A valid API key is required when replacing the key");
+    }
+    return { base_url: baseUrl, api_key_action: action, api_key: input.api_key };
+  }
+  if (input.api_key !== undefined) throw new Error("API key may only be supplied when replacing the key");
+  return { base_url: baseUrl, api_key_action: action };
+}
+
+function validateCodexChatCompletion(value: unknown): {
+  model: string;
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  output_schema: Record<string, unknown>;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Chat completion must be a JSON object");
+  const input = value as Record<string, unknown>;
+  const allowed = new Set(["model", "messages", "response_format", "temperature", "max_tokens", "max_completion_tokens", "stream"]);
+  if (Object.keys(input).some(key => !allowed.has(key))) throw new Error("Unsupported Codex chat completion field");
+  if (typeof input.model !== "string" || !validModelName(input.model)) throw new Error("Invalid Codex model");
+  if (input.stream === true) throw new Error("Streaming Codex completions are not supported");
+  if (!Array.isArray(input.messages) || !input.messages.length || input.messages.length > 64) throw new Error("Invalid Codex chat messages");
+  const messages = input.messages.map(message => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("Invalid Codex chat message");
+    const item = message as Record<string, unknown>;
+    if (Object.keys(item).some(key => !["role", "content"].includes(key))) throw new Error("Unsupported Codex chat message field");
+    if (item.role !== "system" && item.role !== "user" && item.role !== "assistant") throw new Error("Invalid Codex chat role");
+    if (typeof item.content !== "string" || item.content.length > 900_000) throw new Error("Invalid Codex chat content");
+    return { role: item.role as "system" | "user" | "assistant", content: item.content };
+  });
+  const format = input.response_format;
+  if (!format || typeof format !== "object" || Array.isArray(format)) throw new Error("Codex requires a JSON response format");
+  const responseFormat = format as Record<string, unknown>;
+  let schema: Record<string, unknown>;
+  if (responseFormat.type === "json_schema") {
+    const wrapper = responseFormat.json_schema;
+    if (!wrapper || typeof wrapper !== "object" || Array.isArray(wrapper)) throw new Error("Invalid Codex JSON schema");
+    const candidate = (wrapper as Record<string, unknown>).schema;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new Error("Invalid Codex JSON schema");
+    schema = candidate as Record<string, unknown>;
+  } else if (responseFormat.type === "json_object") {
+    schema = { type: "object", additionalProperties: true };
+  } else {
+    throw new Error("Codex only supports JSON response formats");
+  }
+  return { model: input.model, messages, output_schema: schema };
+}
+
+function modelProvider(baseUrl: string | undefined, apiKey: string | undefined): ModelProvider | null {
+  if (!baseUrl?.trim()) return null;
+  return { base_url: baseUrl.trim(), api_key: apiKey || "" };
+}
+
+function generationSource(node: NodeRecord, env: Record<string, string>): GenerationSource | null {
+  if (env.GENERATION_SOURCE === "codex_session" || env.GENERATION_SOURCE === "openai_compatible") return env.GENERATION_SOURCE;
+  if (env.GENERATION_BASE_URL === codexBridgeBaseUrl(Number(env.MANAGER_PORT || 14174), node.node_id)) return "codex_session";
+  if (env.GENERATION_BASE_URL || env.GENERATION_MODEL) return "openai_compatible";
+  return null;
+}
+
+function savedDirectGenerationProvider(
+  node: NodeRecord,
+  env: Record<string, string>,
+): { provider: ModelProvider | null; origin: "generation" | "embedding_fallback" | null; model: string | null } {
+  const activeSource = generationSource(node, env);
+  const saved = modelProvider(env.GENERATION_DIRECT_BASE_URL, env.GENERATION_DIRECT_API_KEY);
+  if (saved) return { provider: saved, origin: "generation", model: env.GENERATION_DIRECT_MODEL || null };
+  if (activeSource !== "codex_session") {
+    const active = modelProvider(env.GENERATION_BASE_URL, env.GENERATION_API_KEY);
+    if (active) return { provider: active, origin: "generation", model: env.GENERATION_MODEL || null };
+  }
+  const embedding = modelProvider(env.EMBEDDING_BASE_URL, env.EMBEDDING_API_KEY);
+  return { provider: embedding, origin: embedding ? "embedding_fallback" : null, model: null };
+}
+
+function directGenerationProvider(
+  node: NodeRecord,
+  env: Record<string, string>,
+  connection: GenerationConnectionInput | undefined,
+): { provider: ModelProvider } {
+  if (!connection) throw new Error("API connection settings are required");
+  const current = savedDirectGenerationProvider(node, env).provider;
+  const sameAddress = Boolean(current && normalizedProviderBaseUrl(current.base_url) === normalizedProviderBaseUrl(connection.base_url));
+  if (connection.api_key_action === "keep") {
+    if (!current || !sameAddress) throw new Error("The saved API key cannot be reused after changing the provider address");
+    return { provider: { base_url: containerProviderBaseUrl(connection.base_url), api_key: current.api_key } };
+  }
+  return {
+    provider: {
+      base_url: containerProviderBaseUrl(connection.base_url),
+      api_key: connection.api_key_action === "replace" ? connection.api_key || "" : "",
+    },
+  };
+}
+
+function preserveDirectGenerationConfiguration(
+  configuration: ModelConfiguration,
+  node: NodeRecord,
+  env: Record<string, string>,
+): void {
+  const direct = savedDirectGenerationProvider(node, env);
+  if (!direct.provider || direct.origin !== "generation") return;
+  configuration.generation_direct_base_url = direct.provider.base_url;
+  configuration.generation_direct_api_key = direct.provider.api_key;
+  if (direct.model) configuration.generation_direct_model = direct.model;
+}
+
+function codexBridgeBaseUrl(managerPort: number, nodeId: string): string {
+  return `http://host.docker.internal:${managerPort}/v1/internal/codex/nodes/${nodeId}`;
+}
+
+function validatedProviderBaseUrl(value: string, label = "base_url"): string {
+  const trimmed = value.trim();
+  let parsed: URL;
+  try { parsed = new URL(trimmed); } catch { throw new Error(`${label} must be an HTTP(S) URL`); }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error(`${label} must be an HTTP(S) URL without credentials, query, or fragment`);
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+function normalizedProviderBaseUrl(value: string): string {
+  const target = new URL(validatedProviderBaseUrl(value));
+  const host = target.hostname.toLowerCase();
+  target.hostname = ["localhost", "host.docker.internal"].includes(host) ? "127.0.0.1" : host;
+  return target.toString().replace(/\/+$/, "");
+}
+
+function containerProviderBaseUrl(value: string): string {
+  const target = new URL(validatedProviderBaseUrl(value));
+  if (["127.0.0.1", "localhost", "::1"].includes(target.hostname.toLowerCase())) target.hostname = "host.docker.internal";
+  return target.toString().replace(/\/$/, "");
+}
+
+function displayProviderUrl(value: string): string {
+  try {
+    const target = new URL(value);
+    target.username = "";
+    target.password = "";
+    target.search = "";
+    target.hash = "";
+    if (target.hostname.toLowerCase() === "host.docker.internal") target.hostname = "127.0.0.1";
+    return target.toString().replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function providerEndpoint(baseUrl: string, resource: "models" | "embeddings" | "chat/completions"): URL {
+  const target = new URL(baseUrl);
+  if (!["http:", "https:"].includes(target.protocol) || target.username || target.password) throw new Error("Invalid provider URL");
+  if (target.hostname.toLowerCase() === "host.docker.internal") target.hostname = "127.0.0.1";
+  const path = target.pathname.replace(/\/+$/, "");
+  target.pathname = path.endsWith(`/${resource}`) ? path : `${path}/${resource}`;
+  target.search = "";
+  target.hash = "";
+  return target;
+}
+
+function validModelName(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !/^https?:\/\//i.test(value) && /^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/.test(value);
+}
+
+function modelNameLeaksProvider(value: string, provider: ModelProvider): boolean {
+  const sensitive = [provider.api_key, provider.base_url];
+  try {
+    const configured = new URL(provider.base_url);
+    sensitive.push(configured.hostname);
+    if (configured.hostname.toLowerCase() === "host.docker.internal") sensitive.push("127.0.0.1");
+  } catch {}
+  return sensitive.some(item => item && sharesSensitiveFragment(value, item));
+}
+
+function sharesSensitiveFragment(value: string, sensitive: string): boolean {
+  const left = value.toLowerCase();
+  const right = sensitive.toLowerCase();
+  const width = Math.min(12, right.length);
+  if (!width) return false;
+  if (left.includes(right) || right.includes(left)) return true;
+  return left.includes(right.slice(0, width)) || left.includes(right.slice(-width));
+}
+
+function likelyEmbeddingModel(value: string): boolean {
+  return /embed(?:ding)?/i.test(value)
+    || /(?:^|[/:._-])(?:bge|e5|gte|instructor|minilm)(?:$|[/:._-])/i.test(value);
+}
+
+function modelRecoveryResult(existing: unknown, restarted: boolean): Record<string, unknown> {
+  const prior = existing && typeof existing === "object" && !Array.isArray(existing)
+    ? existing as Record<string, unknown>
+    : {};
+  return {
+    ...prior,
+    recovery: {
+      runtime_source: "saved_node_environment",
+      restarted,
+      recovery_completed_at: new Date().toISOString(),
+    },
+  };
+}
+
+function roleCatalog(catalog: ModelCatalog, role: "embedding" | "generation"): Pick<ModelSelectionOption, "available_models" | "diagnostic"> {
+  if (catalog.diagnostic) return { available_models: [], diagnostic: catalog.diagnostic };
+  const available = catalog.models.filter(model => role === "embedding" ? likelyEmbeddingModel(model) : !likelyEmbeddingModel(model));
+  if (!available.length && catalog.models.length) {
+    return { available_models: [], diagnostic: `No ${role}-compatible models were found` };
+  }
+  return { available_models: available, diagnostic: null };
 }
 
 function parseVerifiedRevision(output: string, requested: string): string {

@@ -6,7 +6,11 @@ import type {
   NodeBacklog,
   NodeHealth,
   NodeLog,
+  NodeModelSelection,
   NodeSummary,
+  GenerationProbeInput,
+  GenerationProbeResult,
+  ModelSelectionUpdate,
   OperationPlan,
   OperationResult,
   Overview,
@@ -177,6 +181,9 @@ export const managerApi = {
     return payload.nodes.map(normalizeNode);
   },
   health: async (nodeId: string) => normalizeNodeHealth(await managerRequest<RawNodeHealth>(`/v1/nodes/${encodeURIComponent(nodeId)}/health`)),
+  models: (nodeId: string) => managerRequest<NodeModelSelection>(`/v1/nodes/${encodeURIComponent(nodeId)}/models`),
+  probeGeneration: (nodeId: string, input: GenerationProbeInput) => managerRequest<GenerationProbeResult>(`/v1/nodes/${encodeURIComponent(nodeId)}/generation/probe`, json(input)),
+  configureModels: (nodeId: string, updates: ModelSelectionUpdate) => managerOperation(`/v1/nodes/${encodeURIComponent(nodeId)}/models`, json(updates)),
   backlog: async (nodeId: string) => normalizeBacklog(await managerRequest<RawBacklog>(`/v1/nodes/${encodeURIComponent(nodeId)}/backlog`)),
   logs: async (nodeId: string, tail = 100): Promise<NodeLog[]> => {
     const payload = await managerRequest<{ items?: NodeLog[]; logs?: NodeLog[] | string }>(`/v1/nodes/${encodeURIComponent(nodeId)}/logs?service=api&tail=${tail}`);
@@ -242,6 +249,22 @@ interface RawNodeHealth {
   phase: RawNode["phase"];
   components: Array<{ name: string; state: string; health?: string; detail?: string }>;
   endpoints: Record<string, string>;
+  models?: {
+    embedding: {
+      configured: boolean;
+      model?: string;
+      provider_status: "unconfigured" | "configured" | "unknown" | "ready" | "error";
+      provider_detail: string | null;
+      last_probe_at: string | null;
+    };
+    extraction: {
+      configured: boolean;
+      model?: string;
+      provider_status: "unconfigured" | "configured" | "unknown" | "ready" | "error";
+      provider_detail: string | null;
+      last_probe_at: string | null;
+    };
+  };
   error?: string;
 }
 
@@ -349,6 +372,7 @@ export function normalizeNodeHealth(raw: RawNodeHealth): NodeHealth {
     state: normalizeNodePhase(raw.phase),
     components: raw.components,
     endpoints: raw.endpoints,
+    models: raw.models,
     error: raw.error,
     storage: { schema_revision: raw.node.schema_revision },
     updated_at: raw.node.updated_at,

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeManagerBootstrap,
+  managerApi,
   normalizeBackup,
   normalizeBacklog,
   normalizeGraph,
@@ -43,7 +44,7 @@ const rawBackup = {
 describe("API response normalization", () => {
   it("maps manager node, health, and backup fields to UI types", () => {
     expect(normalizeNode(rawNode)).toMatchObject({ id: "node-1", name: "Personal", state: "healthy", version: "0001" });
-    expect(normalizeNodeHealth({ node: rawNode, docker_available: true, phase: "ready", components: [{ name: "database", state: "running", health: "healthy" }], endpoints: { api: "http://127.0.0.1:18001" } })).toMatchObject({ state: "healthy", components: [{ name: "database" }] });
+    expect(normalizeNodeHealth({ node: rawNode, docker_available: true, phase: "ready", components: [{ name: "database", state: "running", health: "healthy" }], endpoints: { api: "http://127.0.0.1:18001" }, models: { embedding: { configured: true, model: "qwen3-embedding:4b", provider_status: "ready", provider_detail: null, last_probe_at: "2026-08-31T00:30:00Z" }, extraction: { configured: false, provider_status: "unconfigured", provider_detail: "generation provider not configured", last_probe_at: null } } })).toMatchObject({ state: "healthy", components: [{ name: "database" }], models: { embedding: { model: "qwen3-embedding:4b", provider_status: "ready" }, extraction: { configured: false } } });
     expect(normalizeBackup(rawBackup)).toMatchObject({ id: "backup-1", label: "before-update", size_bytes: 2048, state: "verified" });
     expect(normalizeBacklog({ node_id: "node-1", available: true, counts: { pending: 2, running: 1, retry: 3, failed: 4 } })).toMatchObject({ pending: 2, running: 1, retrying: 3, failed: 4 });
   });
@@ -55,6 +56,49 @@ describe("API response normalization", () => {
     const migration = normalizeMigrationPlan({ ok: true, node_id: "node-1", current_revision: "0001", target_revision: "0002", requires_backup: true, apply_mode: "new_generation", blockers: [] });
     expect(migration.allowed).toBe(true);
     expect(migration.steps.map(step => step.title)).toContain("현재 데이터를 백업합니다.");
+  });
+
+  it("reads provider choices, probes a generation connection, and posts the selected source", async () => {
+    const modelSelection = {
+      node_id: "node/with space",
+      embedding: { model: "embed-old", available_models: ["embed-old", "embed-new"], diagnostic: null },
+      generation: {
+        active_source: "codex_session",
+        model: "gpt-5.4",
+        available_models: ["gpt-5.4"],
+        diagnostic: null,
+        sources: {
+          codex_session: { available: true, auth_status: "signed_in", plan_type: "pro", available_models: ["gpt-5.4"], diagnostic: null, last_checked_at: "2026-08-31T01:00:00Z" },
+          openai_compatible: { configured: true, connection_origin: "generation", display_base_url: "http://127.0.0.1:11434/v1", api_key_configured: false, model: "gpt-oss:20b", available_models: ["gpt-oss:20b"], diagnostic: null, last_checked_at: "2026-08-31T01:00:00Z" },
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => new Response(JSON.stringify(
+      String(input).endsWith("/generation/probe")
+        ? { source: "openai_compatible", available_models: ["gpt-oss:20b"], model_compatible: true, diagnostic: null }
+        : init?.method === "POST"
+          ? { ok: true, state: "succeeded", result: { restarted: true } }
+          : modelSelection,
+    ), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(managerApi.models("node/with space")).resolves.toEqual(modelSelection);
+    await expect(managerApi.probeGeneration("node/with space", { source: "openai_compatible", model: "gpt-oss:20b", connection: { base_url: "http://127.0.0.1:11434/v1", api_key_action: "keep" } })).resolves.toMatchObject({ model_compatible: true });
+    await expect(managerApi.configureModels("node/with space", { generation: { source: "codex_session", model: "gpt-5.4" } })).resolves.toMatchObject({ state: "succeeded" });
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/\/v1\/nodes\/node%2Fwith%20space\/models$/);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: "include" });
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: "POST",
+      credentials: "include",
+      body: JSON.stringify({ source: "openai_compatible", model: "gpt-oss:20b", connection: { base_url: "http://127.0.0.1:11434/v1", api_key_action: "keep" } }),
+    });
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({
+      method: "POST",
+      credentials: "include",
+      body: JSON.stringify({ generation: { source: "codex_session", model: "gpt-5.4" } }),
+    });
+    expect(String(fetchMock.mock.calls[2]?.[1]?.body)).not.toMatch(/base_url|api_key/i);
   });
 
   it("normalizes core overview, recall, wiki, and graph contracts", () => {
