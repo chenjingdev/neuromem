@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "product": {
+    "name": "neuromem",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/chenjingdev/neuromem"
+  },
+  "services": {
+    "memory_core": {
+      "name": "neuromem-memory-core",
+      "license": "AGPL-3.0-only",
+      "repository": "https://github.com/chenjingdev/neuromem-memory-core",
+      "upstream_repository": "https://github.com/plastic-labs/honcho",
+      "upstream_tag": "v3.1.0",
+      "upstream_commit": "9380bf2753b0001cee6bea34c95896b5bda56fc2",
+      "commit": "44f93346a3bc21de5c76be1105325f95ff64afc6",
+      "source_url": "https://github.com/chenjingdev/neuromem-memory-core/tree/44f93346a3bc21de5c76be1105325f95ff64afc6",
+      "integration": "documented HTTP API",
+      "publication_status": "source-published"
+    }
+  }
+}

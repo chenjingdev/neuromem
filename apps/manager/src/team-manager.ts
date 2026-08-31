@@ -38,7 +38,7 @@ const REQUIRED_ENV = [
   "CONTROL_TOKEN_PEPPER", "CONTROL_INTERNAL_SIGNING_KEY",
   "MEMORY_POSTGRES_DB", "MEMORY_POSTGRES_USER", "MEMORY_POSTGRES_PASSWORD",
   "MEMORY_REDIS_PASSWORD", "MEMORY_INTERNAL_SIGNING_KEY", "MEMORY_AUTH_JWT_SECRET",
-  "MEMORY_CORE_SERVICE_TOKEN", "MEMORY_CORE_IMAGE", "MEMORY_CORE_SOURCE_URL", "MEMORY_CORE_SOURCE_REVISION",
+  "MEMORY_CORE_IMAGE", "MEMORY_CORE_SOURCE_URL", "MEMORY_CORE_SOURCE_REVISION",
   "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
   "GENERATION_BASE_URL", "GENERATION_API_KEY", "GENERATION_MODEL",
   "CONTROL_DB_VOLUME", "MEMORY_DB_VOLUME", "MEMORY_REDIS_VOLUME", "MCP_STATE_VOLUME"
@@ -47,7 +47,7 @@ const REQUIRED_ENV = [
 const SECRET_ENV = [
   "CONTROL_POSTGRES_PASSWORD", "CONTROL_TOKEN_PEPPER", "CONTROL_INTERNAL_SIGNING_KEY",
   "MEMORY_POSTGRES_PASSWORD", "MEMORY_REDIS_PASSWORD", "MEMORY_INTERNAL_SIGNING_KEY",
-  "MEMORY_AUTH_JWT_SECRET", "MEMORY_CORE_SERVICE_TOKEN"
+  "MEMORY_AUTH_JWT_SECRET"
 ] as const;
 
 const TEAM_SERVICES = new Set([
@@ -184,8 +184,24 @@ export class TeamManager {
   async migrationRehearsal(explicitEnv?: string, targetRevision = "head"): Promise<unknown> {
     if (!/^[A-Za-z0-9._-]{1,128}$/.test(targetRevision)) throw new Error("invalid migration target revision");
     const config = await this.validateConfig(explicitEnv);
-    const result = await this.#compose(config.env_file, ["run", "--rm", "--no-deps", "memory-core", "migrate", "--verify", "--target", targetRevision], true, 30 * 60_000, await readPrivateEnv(config.env_file));
-    return { ok: result.ok, applied: false, target_revision: targetRevision, stdout: result.stdout, error: result.ok ? undefined : result.stderr };
+    const env = await readPrivateEnv(config.env_file);
+    await this.#compose(config.env_file, ["up", "-d", "--wait", "--wait-timeout", "300", "memory-database"], false, 5 * 60_000, env);
+    const entrypoint = "/app/.venv/bin/alembic";
+    const current = await this.#compose(config.env_file, ["run", "--rm", "--no-deps", "--entrypoint", entrypoint, "memory-core", "current"], true, 10 * 60_000, env);
+    const heads = await this.#compose(config.env_file, ["run", "--rm", "--no-deps", "--entrypoint", entrypoint, "memory-core", "heads"], true, 10 * 60_000, env);
+    const currentRevisions = revisionIds(current.stdout);
+    const headRevisions = revisionIds(heads.stdout);
+    const atTarget = targetRevision === "head"
+      ? headRevisions.length > 0 && headRevisions.every(revision => currentRevisions.includes(revision))
+      : currentRevisions.some(revision => revision.startsWith(targetRevision.toLowerCase()));
+    return {
+      ok: current.ok && heads.ok && atTarget,
+      applied: false,
+      target_revision: targetRevision,
+      current_revisions: currentRevisions,
+      head_revisions: headRevisions,
+      error: current.ok && heads.ok && atTarget ? undefined : current.stderr || heads.stderr || "Memory Core database is not at the requested revision"
+    };
   }
 
   async backupRehearsal(explicitEnv?: string, outputDirectory?: string): Promise<unknown> {
@@ -298,4 +314,8 @@ function parseComposePs(raw: string): Array<Record<string, unknown>> {
   } catch {
     return [{ service: "compose", state: "unknown", detail: raw.slice(0, 2_000) }];
   }
+}
+
+function revisionIds(raw: string): string[] {
+  return [...new Set((raw.toLowerCase().match(/\b[0-9a-f]{7,64}\b/g) || []))];
 }

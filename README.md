@@ -98,3 +98,32 @@ neuromem skill path
 `/app` is the memory product. `/admin` remains available from the host-side
 Manager even when the database or Core API is unavailable. Restore and schema
 migration apply operations are CLI-only.
+
+## Team memory architecture
+
+The team product adds a sovereign Workspace control plane without treating a
+memory Peer as an authentication identity:
+
+- a Principal is the login, credential, and permission subject;
+- every Principal receives a separate canonical Human Peer in each Workspace;
+- Codex, Claude, shared agents, and services receive their own Agent Peers;
+- a Workspace is the ownership and membership boundary;
+- a Project is the session, recall, derivation, Dream, and Wiki boundary;
+- the default context is the Workspace General Project plus the active Project.
+
+Workspace federation is explicit and read-only. Both Workspace admins approve
+the connection, the source admin grants selected Projects, and the target admin
+assigns that grant to selected local members. Permanent transfer is a separate,
+two-sided approval that writes a new target Message and derives memory again.
+
+The team deployment lives in `deploy/team`. It exposes only Web, Control API,
+and MCP through Cloudflare Tunnel. Databases, Redis, models, and Memory Core are
+private services. The Control Plane is Apache-2.0; the separately distributed
+Memory Core is derived from Honcho v3.1.0 and remains AGPL-3.0-only. The exact
+source boundary is recorded in `SOURCE_MANIFEST.json`.
+
+```sh
+cp deploy/team/team.env.example /private/path/team.env
+docker compose --env-file /private/path/team.env \
+  -f deploy/team/compose.yaml config --quiet
+```

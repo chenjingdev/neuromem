@@ -166,8 +166,21 @@ def test_ingest_search_and_author_spoof_protection(client, bootstrapped):
         }
         stored = client.post("/api/v1/records:batch", headers=headers, json=body)
         assert stored.status_code == 201, stored.text
+        provision_paths = [call["path"] for call in fake.calls[:-1]]
+        assert "/v3/workspaces" in provision_paths
+        assert f"/v3/workspaces/{workspace_id}/peers" in provision_paths
+        assert f"/v3/workspaces/{workspace_id}/projects" in provision_paths
+        project_call = next(
+            call
+            for call in fake.calls
+            if call["path"] == f"/v3/workspaces/{workspace_id}/projects"
+        )
+        assert project_call["payload"]["id"] == "general"
+        assert project_call["context"].project_id == "general"
+        assert "workspace.create" in project_call["context"].capabilities
         message_call = fake.calls[-1]
-        assert message_call["params"]["project_id"] == project_id
+        assert message_call["params"]["project_id"] == "general"
+        assert message_call["context"].project_id == "general"
         assert message_call["payload"]["messages"][0]["peer_id"] == human_peer_id
 
         spoof = dict(body)
@@ -237,6 +250,51 @@ def test_dynamic_context_is_ordered_bounded_and_read_only(client, bootstrapped):
         assert data["sections"][0]["layer"] == "general_wiki"
         assert data["federated_persisted"] is False
         assert all(not call["path"].endswith("/messages") for call in fake.calls)
+    finally:
+        _clear_core_override()
+
+
+def test_named_project_uses_uuid_while_core_overlay_keeps_general_sentinel(
+    client, bootstrapped
+):
+    fake = FakeCore()
+    _override_core(fake)
+    try:
+        token = bootstrapped["recovery_credential"]["token"]
+        workspace_id = bootstrapped["workspace"]["id"]
+        general_id = bootstrapped["general_project"]["id"]
+        created = client.post(
+            f"/api/v1/workspaces/{workspace_id}/projects",
+            headers=auth_headers(token, workspace_id, general_id),
+            json={"slug": "native-project", "name": "Native Project"},
+        )
+        assert created.status_code == 200, created.text
+        project_id = created.json()["id"]
+        headers = auth_headers(token, workspace_id, project_id)
+        recalled = client.post(
+            "/api/v1/recall",
+            headers=headers,
+            json={
+                "workspace_id": workspace_id,
+                "project_id": project_id,
+                "query": "project overlay",
+                "include": ["records", "claims"],
+                "include_general": True,
+            },
+        )
+        assert recalled.status_code == 200, recalled.text
+        search_call = next(
+            call for call in fake.calls if call["path"].endswith("/search")
+        )
+        assert search_call["context"].project_id == project_id
+        assert search_call["payload"]["project_id"] == project_id
+        assert search_call["payload"]["include_general"] is True
+        conclusion_call = next(
+            call for call in fake.calls if call["path"].endswith("/conclusions/query")
+        )
+        assert conclusion_call["payload"]["filters"]["observer"]
+        assert conclusion_call["payload"]["filters"]["observed"]
+        assert recalled.json()["records"][0]["project_id"] == project_id
     finally:
         _clear_core_override()
 

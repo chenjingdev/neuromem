@@ -134,5 +134,7 @@ test("team MCP config reads a separate 0600 credential and backup/migration rehe
 
   const migration = await manager.migrationRehearsal(envFile, "head") as { applied: boolean };
   assert.equal(migration.applied, false);
-  assert.ok(runner.calls.some(call => call.args.join(" ").includes("memory-core migrate --verify --target head")));
+  assert.ok(runner.calls.some(call => call.args.join(" ").includes("--entrypoint /app/.venv/bin/alembic memory-core current")));
+  assert.ok(runner.calls.some(call => call.args.join(" ").includes("--entrypoint /app/.venv/bin/alembic memory-core heads")));
+  assert.equal(runner.calls.some(call => call.args.includes("upgrade")), false);
 });

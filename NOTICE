@@ -1,0 +1,11 @@
+Neuromem product services
+Copyright 2026 chenjing
+
+The Control Plane, Gateway, Manager, MCP adapter, Web application, deployment
+manifests, and related code in this repository are licensed under Apache-2.0.
+
+Neuromem Memory Core is a separate network service derived from Honcho and is
+licensed under AGPL-3.0-only. Its corresponding source, license, and exact
+upstream revision are distributed separately and recorded in
+SOURCE_MANIFEST.json. The Apache package must not vendor or relabel Memory Core
+source, prompts, tests, or migrations.

@@ -19,6 +19,7 @@ coverage/
 .neuromem/
 backups/
 operations/
+deploy/team/team.env
 .playwright-cli/
 output/
 apps/manager/assets/admin-dist/

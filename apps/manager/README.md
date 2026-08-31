@@ -35,6 +35,7 @@ inputs, but does not contain that Memory Core source.
 
 `team preflight` supports DGX Linux/ARM64 with the NVIDIA container runtime and
 Apple Silicon Mac fallback. `team backup rehearse` creates and verifies fresh
-dumps without stopping databases; `team migrate rehearse` invokes verify-only
-mode. `team mcp-config` reads a one-time credential from a separate `0600` file
+dumps without stopping databases; `team migrate rehearse` compares Alembic's
+current revision and code heads without applying a migration. `team mcp-config`
+reads a credential from a separate `0600` file
 so it is not placed on the command line.

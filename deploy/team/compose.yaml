@@ -145,17 +145,13 @@ services:
       NEUROMEM_CONTROL_API_URL: http://control:8000
       NEUROMEM_MCP_AUTH_MODE: team
       NEUROMEM_MCP_ALLOW_REMOTE: "true"
-      NEUROMEM_NODE_ID: team-memory
-      NEUROMEM_NODE_ALIAS: team
-      NEUROMEM_CORE_URL: http://memory-core:8000
-      NEUROMEM_CORE_TOKEN: ${MEMORY_CORE_SERVICE_TOKEN:?MEMORY_CORE_SERVICE_TOKEN is required}
       NEUROMEM_PUBLIC_HOST: ${NEUROMEM_PUBLIC_HOST:?NEUROMEM_PUBLIC_HOST is required}
       NEUROMEM_MCP_STATE_DIR: /var/lib/neuromem-mcp
     volumes:
       - mcp-state:/var/lib/neuromem-mcp
     depends_on:
       control: { condition: service_healthy }
-    networks: [frontend, backend]
+    networks: [frontend]
 
   web:
     image: ${WEB_IMAGE:-neuromem-web:local}
@@ -163,8 +159,7 @@ services:
       context: ${WEB_BUILD_CONTEXT:-../../apps/web}
     restart: unless-stopped
     environment:
-      CORE_API_UPSTREAM: http://control:8000/api
-      CORE_API_TOKEN: unused-team-edge-session
+      CONTROL_API_UPSTREAM: http://control:8000
     depends_on:
       control: { condition: service_healthy }
     networks: [frontend]

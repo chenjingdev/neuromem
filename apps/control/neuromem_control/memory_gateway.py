@@ -69,6 +69,16 @@ def _scope(
     return project
 
 
+def _core_project_id(project: Project) -> str:
+    """Translate the product's stable Project UUID to Core's General sentinel."""
+
+    return "general" if project.is_general else project.id
+
+
+def _core_context(context: AuthContext, project: Project) -> AuthContext:
+    return context.model_copy(update={"project_id": _core_project_id(project)})
+
+
 def _observer(auth: CurrentAuth, requested: str | None = None) -> str:
     allowed = {
         peer_id
@@ -84,6 +94,74 @@ def _observer(auth: CurrentAuth, requested: str | None = None) -> str:
             detail="observer Peer must be bound to the authenticated credential",
         )
     return selected
+
+
+def _provisioning_context(auth: CurrentAuth, *, project: Project) -> AuthContext:
+    """Narrowly elevate only the trusted Control-to-Core provisioning call."""
+
+    return auth.context.model_copy(
+        update={
+            "workspace_id": project.workspace_id,
+            "project_id": _core_project_id(project),
+            "capabilities": sorted(
+                set(auth.context.capabilities)
+                | {
+                    "workspace.create",
+                    "project.create",
+                    "project.read",
+                    "project.write",
+                    "agent.manage",
+                }
+            ),
+        }
+    )
+
+
+def _ensure_core_scope(
+    core: MemoryCoreClient,
+    auth: CurrentAuth,
+    project: Project,
+) -> Any:
+    """Idempotently provision Workspace, bound Peers, and Project in Core."""
+
+    workspace_id = project.workspace_id
+    context = _provisioning_context(auth, project=project)
+    core.request(
+        method="POST",
+        path="/v3/workspaces",
+        context=context,
+        payload={"id": workspace_id},
+        idempotency_key=f"workspace:{workspace_id}",
+    )
+    for peer_id, kind in (
+        (auth.context.human_peer_id, "human"),
+        (auth.context.agent_peer_id, "agent"),
+    ):
+        if not peer_id:
+            continue
+        core.request(
+            method="POST",
+            path=f"/v3/workspaces/{workspace_id}/peers",
+            context=context,
+            payload={
+                "id": peer_id,
+                "metadata": {"neuromem_peer_kind": kind},
+            },
+            idempotency_key=f"peer:{workspace_id}:{peer_id}",
+        )
+    return core.request(
+        method="POST",
+        path=f"/v3/workspaces/{workspace_id}/projects",
+        context=context,
+        payload={
+            "id": _core_project_id(project),
+            "name": project.name,
+            "restricted": project.access_policy == "restricted",
+            "metadata": {"wiki_id": project.wiki_id},
+            "configuration": {},
+        },
+        idempotency_key=f"project:{workspace_id}:{_core_project_id(project)}",
+    )
 
 
 def _as_items(payload: Any) -> list[dict[str, Any]]:
@@ -103,10 +181,14 @@ def _normalize_record(
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     record_id = metadata.get("neuromem_record_id") or item.get("id")
     content = str(item.get("content") or item.get("matched_content") or "")
+    item_project_id = item.get("project_id")
+    normalized_project_id = (
+        project_id if item_project_id in (None, "general") else str(item_project_id)
+    )
     return {
         **item,
         "record_id": str(record_id),
-        "project_id": str(item.get("project_id") or project_id),
+        "project_id": normalized_project_id,
         "content": content,
         "matched_content": str(item.get("matched_content") or content),
         "rank": int(item.get("rank") or rank),
@@ -120,10 +202,14 @@ def _normalize_claim(
     evidence_ids = item.get("evidence_ids")
     if not isinstance(evidence_ids, list):
         evidence_ids = []
+    item_project_id = item.get("project_id")
+    normalized_project_id = (
+        project_id if item_project_id in (None, "general") else str(item_project_id)
+    )
     return {
         **item,
         "claim_id": str(claim_id),
-        "project_id": str(item.get("project_id") or project_id),
+        "project_id": normalized_project_id,
         "content": str(item.get("content") or item.get("text") or ""),
         "status": str(item.get("status") or "active"),
         "derivation_method": str(item.get("derivation_method") or "explicit"),
@@ -136,10 +222,13 @@ def _search_local(
     core: MemoryCoreClient,
     context: AuthContext,
     body: MemorySearchRequest,
+    project: Project,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     claims: list[dict[str, Any]] = []
-    filters: dict[str, Any] = {"project_id": body.project_id}
+    core_project_id = _core_project_id(project)
+    core_context = _core_context(context, project)
+    filters: dict[str, Any] = {"project_id": core_project_id}
     if body.after:
         filters["created_at"] = {"$gte": body.after.isoformat()}
     if body.before:
@@ -153,12 +242,12 @@ def _search_local(
         payload = core.request(
             method="POST",
             path=path,
-            context=context,
+            context=core_context,
             payload={
                 "query": body.query,
                 "limit": body.limit,
                 "filters": filters,
-                "project_id": body.project_id,
+                "project_id": core_project_id,
                 "include_general": body.include_general,
             },
         )
@@ -167,15 +256,26 @@ def _search_local(
             for index, item in enumerate(_as_items(payload), start=1)
         ]
     if "claims" in body.include:
+        observer = core_context.agent_peer_id or core_context.human_peer_id
+        observed = core_context.human_peer_id or observer
+        if not observer or not observed:
+            raise HTTPException(
+                status_code=409,
+                detail="Conclusion search requires bound observer and observed Peers",
+            )
         payload = core.request(
             method="POST",
             path=f"/v3/workspaces/{body.workspace_id}/conclusions/query",
-            context=context,
+            context=core_context,
             payload={
                 "query": body.query,
                 "top_k": body.limit,
-                "filters": filters,
-                "project_id": body.project_id,
+                "filters": {
+                    **filters,
+                    "observer": observer,
+                    "observed": observed,
+                },
+                "project_id": core_project_id,
                 "include_general": body.include_general,
             },
         )
@@ -237,6 +337,15 @@ def _search_federated(
     records: list[dict[str, Any]] = []
     claims: list[dict[str, Any]] = []
     for grant, link in _federated_grants(db, auth):
+        source_project = db.scalar(
+            select(Project).where(
+                Project.id == grant.source_project_id,
+                Project.workspace_id == link.source_workspace_id,
+                Project.status == "active",
+            )
+        )
+        if source_project is None:
+            continue
         source_context = auth.context.model_copy(
             update={
                 "workspace_id": link.source_workspace_id,
@@ -254,7 +363,9 @@ def _search_federated(
                 "include_federated": False,
             }
         )
-        source_records, source_claims = _search_local(core, source_context, source_body)
+        source_records, source_claims = _search_local(
+            core, source_context, source_body, source_project
+        )
         provenance = {
             "federated": True,
             "federated_grant_id": grant.id,
@@ -284,19 +395,18 @@ def ensure_memory_project(
         project_id=project_id,
         capability="project.create",
     )
-    return core.request(
-        method="POST",
-        path=f"/v3/workspaces/{workspace_id}/projects",
-        context=auth.context,
-        payload={
-            "id": project.id,
-            "name": project.name,
-            "restricted": project.access_policy == "restricted",
-            "metadata": {**body.metadata, "wiki_id": project.wiki_id},
-            "configuration": body.configuration,
-        },
-        idempotency_key=f"project:{project.id}",
-    )
+    result = _ensure_core_scope(core, auth, project)
+    if body.metadata or body.configuration:
+        result = core.request(
+            method="PUT",
+            path=f"/v3/workspaces/{workspace_id}/projects/{_core_project_id(project)}",
+            context=_provisioning_context(auth, project=project),
+            payload={
+                "metadata": {**body.metadata, "wiki_id": project.wiki_id},
+                "configuration": body.configuration,
+            },
+        )
+    return result
 
 
 @router.post("/memory/sessions", tags=["memory"])
@@ -316,21 +426,23 @@ def create_memory_session(
         raise HTTPException(
             status_code=400, detail="Workspace/Project context required"
         )
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=workspace_id,
         project_id=project_id,
         capability="project.write",
     )
+    _ensure_core_scope(core, auth, project)
+    core_project_id = _core_project_id(project)
     return core.request(
         method="POST",
         path=f"/v3/workspaces/{workspace_id}/sessions",
-        context=auth.context,
-        params={"project_id": project_id},
+        context=_core_context(auth.context, project),
+        params={"project_id": core_project_id},
         payload={
             "id": body.session_id,
-            "project_id": project_id,
+            "project_id": core_project_id,
             "metadata": {**body.metadata, "name": body.name},
             "configuration": body.configuration,
         },
@@ -350,13 +462,15 @@ def ingest_memory_records(
     session_id = request.path_params.get("session_id")
     if session_id is not None and session_id != body.session_id:
         raise HTTPException(status_code=400, detail="session ID mismatch")
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=body.workspace_id,
         project_id=body.project_id,
         capability="project.write",
     )
+    _ensure_core_scope(core, auth, project)
+    core_project_id = _core_project_id(project)
     allowed_authors = {
         peer_id
         for peer_id in (auth.context.human_peer_id, auth.context.agent_peer_id)
@@ -382,7 +496,7 @@ def ingest_memory_records(
                 "author_kind": record.author_kind,
                 "record_kind": record.kind,
                 "source_app": record.source_app,
-                "project_id": body.project_id,
+                "project_id": core_project_id,
             },
         }
         for record in body.records
@@ -392,9 +506,9 @@ def ingest_memory_records(
         path=(
             f"/v3/workspaces/{body.workspace_id}/sessions/{body.session_id}/messages"
         ),
-        context=auth.context,
-        params={"project_id": body.project_id},
-        payload={"messages": messages, "project_id": body.project_id},
+        context=_core_context(auth.context, project),
+        params={"project_id": core_project_id},
+        payload={"messages": messages, "project_id": core_project_id},
         idempotency_key=body.records[0].id if len(body.records) == 1 else None,
     )
     audit_auth(
@@ -424,14 +538,15 @@ def search_memory(
     auth: CurrentAuth,
     core: Core,
 ) -> dict[str, Any]:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=body.workspace_id,
         project_id=body.project_id,
         capability="project.read",
     )
-    records, claims = _search_local(core, auth.context, body)
+    _ensure_core_scope(core, auth, project)
+    records, claims = _search_local(core, auth.context, body, project)
     if body.include_federated:
         federated_records, federated_claims = _search_federated(db, core, auth, body)
         records.extend(federated_records)
@@ -459,28 +574,37 @@ def query_conclusions(
         raise HTTPException(
             status_code=400, detail="Workspace/Project context required"
         )
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=workspace_id,
         project_id=project_id,
         capability="project.read",
     )
-    filters = {**body.filters, "project_id": project_id}
-    if body.observer_peer_id:
-        filters["observer"] = body.observer_peer_id
-    if body.observed_peer_id:
-        filters["observed"] = body.observed_peer_id
+    _ensure_core_scope(core, auth, project)
+    core_project_id = _core_project_id(project)
+    core_context = _core_context(auth.context, project)
+    observer = (
+        body.observer_peer_id
+        or core_context.agent_peer_id
+        or core_context.human_peer_id
+    )
+    observed = body.observed_peer_id or core_context.human_peer_id or observer
+    filters = {**body.filters, "project_id": core_project_id}
+    if observer:
+        filters["observer"] = observer
+    if observed:
+        filters["observed"] = observed
     if body.query:
         payload = core.request(
             method="POST",
             path=f"/v3/workspaces/{workspace_id}/conclusions/query",
-            context=auth.context,
+            context=core_context,
             payload={
                 "query": body.query,
                 "top_k": body.limit,
                 "filters": filters,
-                "project_id": project_id,
+                "project_id": core_project_id,
                 "include_general": body.include_general,
             },
         )
@@ -488,11 +612,11 @@ def query_conclusions(
         payload = core.request(
             method="POST",
             path=f"/v3/workspaces/{workspace_id}/conclusions/list",
-            context=auth.context,
+            context=core_context,
             params={"size": body.limit},
             payload={
                 "filters": filters,
-                "project_id": project_id,
+                "project_id": core_project_id,
                 "include_general": body.include_general,
             },
         )
@@ -515,7 +639,7 @@ def get_memory_representation(
     include_general: Annotated[bool, Query()] = True,
     search_query: Annotated[str | None, Query()] = None,
 ) -> dict[str, Any]:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=workspace_id,
@@ -523,14 +647,15 @@ def get_memory_representation(
         capability="project.read",
     )
     observer = _observer(auth)
+    core_project_id = _core_project_id(project)
     payload = core.request(
         method="POST",
         path=f"/v3/workspaces/{workspace_id}/peers/{observer}/representation",
-        context=auth.context,
+        context=_core_context(auth.context, project),
         payload={
             "target": peer_id,
             "search_query": search_query,
-            "project_id": project_id,
+            "project_id": core_project_id,
             "include_general": include_general,
         },
     )
@@ -557,7 +682,7 @@ def get_memory_peer_card(
     project_id: Annotated[str, Query()],
     include_general: Annotated[bool, Query()] = True,
 ) -> dict[str, Any]:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=workspace_id,
@@ -565,13 +690,14 @@ def get_memory_peer_card(
         capability="project.read",
     )
     observer = _observer(auth)
+    core_project_id = _core_project_id(project)
     payload = core.request(
         method="GET",
         path=f"/v3/workspaces/{workspace_id}/peers/{observer}/card",
-        context=auth.context,
+        context=_core_context(auth.context, project),
         params={
             "target": peer_id,
-            "project_id": project_id,
+            "project_id": core_project_id,
             "include_general": include_general,
         },
     )
@@ -599,22 +725,23 @@ def get_memory_session_context(
     include_general: Annotated[bool, Query()] = True,
     tokens: Annotated[int | None, Query(ge=128, le=128000)] = None,
 ) -> dict[str, Any]:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=workspace_id,
         project_id=project_id,
         capability="project.read",
     )
+    core_project_id = _core_project_id(project)
     payload = core.request(
         method="GET",
         path=f"/v3/workspaces/{workspace_id}/sessions/{session_id}/context",
-        context=auth.context,
+        context=_core_context(auth.context, project),
         params={
             "tokens": tokens,
             "peer_target": auth.context.human_peer_id,
             "peer_perspective": auth.context.agent_peer_id,
-            "project_id": project_id,
+            "project_id": core_project_id,
             "include_general": include_general,
         },
     )
@@ -636,7 +763,7 @@ def memory_chat(
     auth: CurrentAuth,
     core: Core,
 ) -> Any:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=body.workspace_id,
@@ -649,16 +776,17 @@ def memory_chat(
             detail="federated Dialectic is not supported; use /context instead",
         )
     observer = _observer(auth, body.observer_peer_id)
+    core_project_id = _core_project_id(project)
     return core.request(
         method="POST",
         path=f"/v3/workspaces/{body.workspace_id}/peers/{observer}/chat",
-        context=auth.context,
+        context=_core_context(auth.context, project),
         payload={
             "query": body.query,
             "target": body.target_peer_id or auth.context.human_peer_id,
             "session_id": body.session_id,
             "reasoning_level": body.reasoning_level,
-            "project_id": body.project_id,
+            "project_id": core_project_id,
             "include_general": body.include_general,
         },
     )
@@ -672,7 +800,7 @@ def schedule_memory_dream(
     auth: CurrentAuth,
     core: Core,
 ) -> Any:
-    _scope(
+    project = _scope(
         db,
         auth,
         workspace_id=body.workspace_id,
@@ -680,16 +808,17 @@ def schedule_memory_dream(
         capability="project.write",
     )
     observer = _observer(auth, body.observer_peer_id)
+    core_project_id = _core_project_id(project)
     result = core.request(
         method="POST",
         path=f"/v3/workspaces/{body.workspace_id}/schedule_dream",
-        context=auth.context,
+        context=_core_context(auth.context, project),
         payload={
             "observer": observer,
             "observed": body.observed_peer_id or auth.context.human_peer_id,
             "dream_type": body.strategy,
             "session_id": body.session_id,
-            "project_id": body.project_id,
+            "project_id": core_project_id,
             "include_general": True,
             "force": body.force,
         },
@@ -820,6 +949,7 @@ def compile_dynamic_context(
         project_id=body.project_id,
         capability="project.read",
     )
+    _ensure_core_scope(core, auth, project)
     builder = _ContextBuilder(body.token_budget)
     general = db.scalar(
         select(Project).where(
@@ -849,6 +979,7 @@ def compile_dynamic_context(
 
     observer = _observer(auth, body.observer_peer_id)
     target = body.peer_id or auth.context.human_peer_id
+    core_project_id = _core_project_id(project)
     if target:
         try:
             representation_payload = core.request(
@@ -857,11 +988,11 @@ def compile_dynamic_context(
                     f"/v3/workspaces/{body.workspace_id}/peers/"
                     f"{observer}/representation"
                 ),
-                context=auth.context,
+                context=_core_context(auth.context, project),
                 payload={
                     "target": target,
                     "search_query": body.query,
-                    "project_id": body.project_id,
+                    "project_id": core_project_id,
                     "include_general": body.include_general,
                 },
             )
@@ -889,7 +1020,7 @@ def compile_dynamic_context(
         include_general=body.include_general,
         include_federated=body.include_federated,
     )
-    records, claims = _search_local(core, auth.context, search_body)
+    records, claims = _search_local(core, auth.context, search_body, project)
     if body.include_federated:
         federated_records, federated_claims = _search_federated(
             db, core, auth, search_body

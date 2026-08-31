@@ -28,6 +28,11 @@ from .core_client import (
 )
 from .db import db_session, get_engine
 from .ids import uuid7
+from .memory_gateway import (
+    _core_project_id,
+    _ensure_core_scope,
+    _provisioning_context,
+)
 from .memory_gateway import router as memory_router
 from .models import (
     AgentPeerOwnership,
@@ -1248,6 +1253,17 @@ def post_complete_transfer(
                 detail="target workspace must complete the import",
             )
         require_admin_membership(db, auth.principal.id, transfer.target_workspace_id)
+        target_project = db.scalar(
+            select(Project).where(
+                Project.id == transfer.target_project_id,
+                Project.workspace_id == transfer.target_workspace_id,
+                Project.status == "active",
+            )
+        )
+        if target_project is None:
+            raise HTTPException(status_code=404, detail="target project not found")
+        _ensure_core_scope(core, auth, target_project)
+        core_project_id = _core_project_id(target_project)
         system_peer = db.scalar(
             select(Peer).where(
                 Peer.workspace_id == transfer.target_workspace_id,
@@ -1263,9 +1279,7 @@ def post_complete_transfer(
             )
             db.add(system_peer)
             db.flush()
-        target_context = auth.context.model_copy(
-            update={"project_id": transfer.target_project_id}
-        )
+        target_context = _provisioning_context(auth, project=target_project)
         core.request(
             method="POST",
             path=f"/v3/workspaces/{transfer.target_workspace_id}/peers",
@@ -1281,10 +1295,10 @@ def post_complete_transfer(
             method="POST",
             path=f"/v3/workspaces/{transfer.target_workspace_id}/sessions",
             context=target_context,
-            params={"project_id": transfer.target_project_id},
+            params={"project_id": core_project_id},
             payload={
                 "id": session_id,
-                "project_id": transfer.target_project_id,
+                "project_id": core_project_id,
                 "metadata": {"transfer_request_id": transfer.id},
                 "peers": {system_peer.id: {}},
             },
@@ -1297,9 +1311,9 @@ def post_complete_transfer(
                 f"{session_id}/messages"
             ),
             context=target_context,
-            params={"project_id": transfer.target_project_id},
+            params={"project_id": core_project_id},
             payload={
-                "project_id": transfer.target_project_id,
+                "project_id": core_project_id,
                 "messages": [
                     {
                         "peer_id": system_peer.id,
