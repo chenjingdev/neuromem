@@ -256,33 +256,51 @@ def _search_local(
             for index, item in enumerate(_as_items(payload), start=1)
         ]
     if "claims" in body.include:
-        observer = core_context.agent_peer_id or core_context.human_peer_id
-        observed = core_context.human_peer_id or observer
-        if not observer or not observed:
-            raise HTTPException(
-                status_code=409,
-                detail="Conclusion search requires bound observer and observed Peers",
+        human_peer = core_context.human_peer_id
+        agent_peer = core_context.agent_peer_id
+        pairs = list(
+            dict.fromkeys(
+                pair
+                for pair in (
+                    (agent_peer, human_peer),
+                    (agent_peer, agent_peer),
+                    (human_peer, human_peer),
+                )
+                if pair[0] and pair[1]
             )
-        payload = core.request(
-            method="POST",
-            path=f"/v3/workspaces/{body.workspace_id}/conclusions/query",
-            context=core_context,
-            payload={
-                "query": body.query,
-                "top_k": body.limit,
-                "filters": {
-                    **filters,
-                    "observer": observer,
-                    "observed": observed,
-                },
-                "project_id": core_project_id,
-                "include_general": body.include_general,
-            },
         )
-        claims = [
-            _normalize_claim(item, project_id=body.project_id, rank=index)
-            for index, item in enumerate(_as_items(payload), start=1)
-        ]
+        # A federated read deliberately strips the target Workspace's Peer
+        # identity. In that case return message hits only rather than inventing
+        # an observer/observed pair or leaking a source Peer.
+        if not pairs:
+            return records[: body.limit], []
+        seen_claims: set[str] = set()
+        for observer, observed in pairs:
+            payload = core.request(
+                method="POST",
+                path=f"/v3/workspaces/{body.workspace_id}/conclusions/query",
+                context=core_context,
+                payload={
+                    "query": body.query,
+                    "top_k": body.limit,
+                    "filters": {
+                        **filters,
+                        "observer": observer,
+                        "observed": observed,
+                    },
+                    "project_id": core_project_id,
+                    "include_general": body.include_general,
+                },
+            )
+            for item in _as_items(payload):
+                normalized = _normalize_claim(
+                    item, project_id=body.project_id, rank=len(claims) + 1
+                )
+                claim_id = normalized["claim_id"]
+                if claim_id in seen_claims:
+                    continue
+                seen_claims.add(claim_id)
+                claims.append(normalized)
     return records[: body.limit], claims[: body.limit]
 
 
@@ -445,6 +463,14 @@ def create_memory_session(
             "project_id": core_project_id,
             "metadata": {**body.metadata, "name": body.name},
             "configuration": body.configuration,
+            "peers": {
+                peer_id: {}
+                for peer_id in (
+                    auth.context.human_peer_id,
+                    auth.context.agent_peer_id,
+                )
+                if peer_id
+            },
         },
         idempotency_key=f"session:{project_id}:{body.session_id}",
     )

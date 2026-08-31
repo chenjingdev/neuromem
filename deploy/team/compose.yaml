@@ -73,6 +73,8 @@ services:
       DERIVER_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
       DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
       DERIVER_MODEL_CONFIG__OVERRIDES__API_KEY: ${GENERATION_API_KEY}
+      DERIVER_REPRESENTATION_BATCH_WORK_UNIT_TARGET_TOKENS: ${DERIVER_BATCH_TARGET_TOKENS:-512}
+      DERIVER_REPRESENTATION_BATCH_MAX_AGE_SECONDS: ${DERIVER_BATCH_MAX_AGE_SECONDS:-1800}
       SUMMARY_MODEL_CONFIG__TRANSPORT: openai
       SUMMARY_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
       SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
@@ -203,5 +205,6 @@ volumes:
 
 networks:
   frontend: {}
-  backend:
-    internal: true
+  # No backend service publishes a host port. Egress remains available for the
+  # configured model endpoint and first-run provider checks on Mac/DGX.
+  backend: {}

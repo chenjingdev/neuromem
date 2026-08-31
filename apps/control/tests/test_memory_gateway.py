@@ -365,6 +365,10 @@ def test_approved_transfer_is_imported_by_gateway_with_provenance(client, bootst
         message_call = next(
             call for call in fake.calls if call["path"].endswith("/messages")
         )
+        assert (
+            message_call["context"].agent_peer_id
+            == completed.json()["provenance"]["import_system_peer_id"]
+        )
         metadata = message_call["payload"]["messages"][0]["metadata"]
         assert (
             metadata["source_content_hash"]

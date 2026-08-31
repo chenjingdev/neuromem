@@ -13,10 +13,12 @@
       "upstream_repository": "https://github.com/plastic-labs/honcho",
       "upstream_tag": "v3.1.0",
       "upstream_commit": "9380bf2753b0001cee6bea34c95896b5bda56fc2",
-      "commit": "44f93346a3bc21de5c76be1105325f95ff64afc6",
-      "source_url": "https://github.com/chenjingdev/neuromem-memory-core/tree/44f93346a3bc21de5c76be1105325f95ff64afc6",
+      "commit": "307a6051ffe0b56bfaad88d8c905f4aa00f73724",
+      "source_url": "https://github.com/chenjingdev/neuromem-memory-core/tree/307a6051ffe0b56bfaad88d8c905f4aa00f73724",
+      "image": "ghcr.io/chenjingdev/neuromem-memory-core@sha256:15669c488866012c2762a4eefca2e8e9aa3b589a3eb874f12e49c8917aa7e365",
+      "platform": "linux/arm64",
       "integration": "documented HTTP API",
-      "publication_status": "source-published"
+      "publication_status": "source-and-image-published"
     }
   }
 }

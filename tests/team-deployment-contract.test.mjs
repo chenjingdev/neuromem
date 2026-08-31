@@ -28,7 +28,7 @@ test("team deployment exposes only the loopback edge and Cloudflare ingress", as
 
   assert.match(compose, /127\.0\.0\.1:\$\{EDGE_LOOPBACK_PORT/);
   assert.match(compose, /cloudflare\/cloudflared:/);
-  assert.match(compose, /backend:\n\s+internal: true/);
+  assert.match(compose, /backend: \{\}/);
 });
 
 test("edge sends API and MCP traffic only to product gateways", async () => {

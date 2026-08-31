@@ -1279,7 +1279,9 @@ def post_complete_transfer(
             )
             db.add(system_peer)
             db.flush()
-        target_context = _provisioning_context(auth, project=target_project)
+        target_context = _provisioning_context(auth, project=target_project).model_copy(
+            update={"agent_peer_id": system_peer.id}
+        )
         core.request(
             method="POST",
             path=f"/v3/workspaces/{transfer.target_workspace_id}/peers",
