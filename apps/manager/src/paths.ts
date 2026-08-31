@@ -11,6 +11,9 @@ export interface ManagerPaths {
   adminToken: string;
   adminNonces: string;
   managerLog: string;
+  team: string;
+  teamEnv: string;
+  teamBackups: string;
 }
 
 export function resolveManagerPaths(env: NodeJS.ProcessEnv = process.env): ManagerPaths {
@@ -35,6 +38,9 @@ export function resolveManagerPaths(env: NodeJS.ProcessEnv = process.env): Manag
     adminToken: path.join(manager, "admin.token"),
     adminNonces: path.join(manager, "admin-nonces.json"),
     managerLog: path.join(manager, "manager.log"),
+    team: path.join(home, "team"),
+    teamEnv: path.join(home, "team", "team.env"),
+    teamBackups: path.join(home, "team", "backups"),
   };
 }
 

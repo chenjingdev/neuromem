@@ -41,6 +41,13 @@ await copyContext("core", [
   "apps/core/alembic",
   "apps/core/neuromem_core",
 ]);
+await copyContext("control", [
+  "apps/control/Dockerfile",
+  "apps/control/pyproject.toml",
+  "apps/control/uv.lock",
+  "apps/control/README.md",
+  "apps/control/neuromem_control",
+]);
 await copyContext("mcp", [
   "apps/mcp/.dockerignore",
   "apps/mcp/Dockerfile",
@@ -64,9 +71,15 @@ await copyContext("web", [
   "apps/web/src",
 ]);
 
+const teamAssets = path.join(assets, "team");
+await resetDirectory(teamAssets);
+for (const name of ["compose.yaml", "nginx.conf", "team.env.example", "README.md"]) {
+  await fs.copyFile(path.join(root, "deploy", "team", name), path.join(teamAssets, name));
+}
+
 await fs.writeFile(
   path.join(assets, "build-manifest.json"),
-  `${JSON.stringify({ format: 1, version: "0.1.0", images: ["core", "mcp", "web"] }, null, 2)}\n`,
+  `${JSON.stringify({ format: 1, version: "0.1.0", images: ["core", "control", "mcp", "web"], team_deployment: "assets/team/compose.yaml", memory_core_vendored: false }, null, 2)}\n`,
   { mode: 0o644 },
 );
 await fs.copyFile(path.join(root, "LICENSE"), path.join(managerRoot, "LICENSE"));

@@ -35,7 +35,10 @@ test("packed CLI installs in an isolated prefix and exposes help without host mu
   assert.match(listing.stdout, /package\/assets\/admin-dist\/index\.html/);
   assert.match(listing.stdout, /package\/assets\/admin-dist\/assets\/[^\n]+-[A-Za-z0-9_-]+\.js/);
   assert.match(listing.stdout, /package\/assets\/admin-dist\/assets\/[^\n]+-[A-Za-z0-9_-]+\.css/);
-  for (const image of ["core", "mcp", "web"]) assert.match(listing.stdout, new RegExp(`package/assets/images/${image}/Dockerfile`));
+  for (const image of ["core", "control", "mcp", "web"]) assert.match(listing.stdout, new RegExp(`package/assets/images/${image}/Dockerfile`));
+  for (const file of ["compose.yaml", "nginx.conf", "team.env.example", "README.md"]) {
+    assert.match(listing.stdout, new RegExp(`package/assets/team/${file.replace(".", "\\.")}`));
+  }
   assert.match(listing.stdout, /package\/LICENSE/);
   assert.match(listing.stdout, /package\/assets\/skill\/neuromem-memory\/SKILL\.md/);
   const prefix = path.join(temporary, "prefix");
@@ -84,6 +87,18 @@ test("packed CLI installs in an isolated prefix and exposes help without host mu
   });
   assert.equal(launched.code, 0, launched.stderr);
   assert.match(launched.stdout, /"dashboard": "http:\/\/127\.0\.0\.1:14173\/app"/);
+});
+
+test("packaged team deployment references a pinned external Memory Core without vendoring its source", async () => {
+  const prepared = spawnSync("npm", ["run", "prepack"], { encoding: "utf8" });
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const compose = await fs.readFile(path.resolve("assets/team/compose.yaml"), "utf8");
+  assert.match(compose, /MEMORY_CORE_IMAGE:\?MEMORY_CORE_IMAGE digest is required/);
+  assert.match(compose, /MEMORY_CORE_SOURCE_URL/);
+  assert.doesNotMatch(compose, /MEMORY_CORE_CONTEXT|context:.*memory-core/i);
+  const manifest = JSON.parse(await fs.readFile(path.resolve("assets/build-manifest.json"), "utf8"));
+  assert.equal(manifest.memory_core_vendored, false);
+  assert.equal(manifest.team_deployment, "assets/team/compose.yaml");
 });
 
 test("packaged Compose contract stays aligned with the root deployment contract", async () => {

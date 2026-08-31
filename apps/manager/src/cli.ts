@@ -11,6 +11,7 @@ import { resolveManagerPaths } from "./paths.js";
 import { ProcessRunner } from "./process-runner.js";
 import { installSupervisor } from "./supervisor.js";
 import { persistManagerRuntimeConfig } from "./runtime-config.js";
+import { TeamManager, type TeamTarget } from "./team-manager.js";
 import type { NodeRecord, OperationRecord, RegistryFile } from "./types.js";
 
 const VERSION = "0.1.0";
@@ -56,6 +57,14 @@ Usage:
   neuromem node restore plan|apply [--node ID] --backup ID [--confirm UUID]
   neuromem node migrate plan|apply|verify [--node ID] [--target head] [--confirm UUID]
   neuromem node delete [--node ID] --confirm UUID [--purge-data]
+  neuromem team config validate [--env /private/team.env]
+  neuromem team preflight [--target auto|dgx|mac]
+  neuromem team start|stop|status [--env /private/team.env] [--target auto|dgx|mac]
+  neuromem team logs [--service control] [--tail 200]
+  neuromem team schema init
+  neuromem team mcp-config --credential-file /private/credential [--format json|toml]
+  neuromem team backup rehearse [--output /private/backup-dir]
+  neuromem team migrate rehearse [--target-revision head]
 
 Options:
   --help
@@ -121,6 +130,7 @@ async function main(): Promise<void> {
   if (flag("--version") || args[0] === "version") return print(VERSION);
   if (args[0] === "skill" && args[1] === "path") return print(packagedSkillPath());
   await persistManagerRuntimeConfig(paths, process.env);
+  if (args[0] === "team") return teamCommand();
   if (!args.length || (args.length === 1 && args[0] === "--no-open")) return defaultLaunch();
   await ensureManager();
   if (args[0] === "admin" && args[1] === "open") {
@@ -201,6 +211,30 @@ async function main(): Promise<void> {
   }
   help();
   process.exitCode = 1;
+}
+
+async function teamCommand(): Promise<void> {
+  const team = new TeamManager({ paths, runner });
+  const envFile = take("--env");
+  const target = take("--target", "auto") as TeamTarget;
+  if (args[1] === "config" && args[2] === "validate") return print(await team.validateConfig(envFile));
+  if (args[1] === "preflight") return print(await team.preflight(target));
+  if (args[1] === "start") return print(await team.start({ envFile, target }));
+  if (args[1] === "stop") return print(await team.stop(envFile));
+  if (args[1] === "status") return print(await team.status(envFile));
+  if (args[1] === "logs") return print(await team.logs(envFile, take("--service", "control")!, Number(take("--tail", "200"))));
+  if (args[1] === "schema" && args[2] === "init") {
+    const resolved = target === "auto" ? (await team.preflight("auto")).target : target;
+    return print(await team.schemaInit(envFile, resolved as Exclude<TeamTarget, "auto">));
+  }
+  if (args[1] === "mcp-config") {
+    const format = take("--format", "json");
+    if (format !== "json" && format !== "toml") throw new Error("--format must be json or toml");
+    return print(await team.mcpConfig(envFile, required("--credential-file"), format));
+  }
+  if (args[1] === "backup" && args[2] === "rehearse") return print(await team.backupRehearsal(envFile, take("--output")));
+  if (args[1] === "migrate" && args[2] === "rehearse") return print(await team.migrationRehearsal(envFile, take("--target-revision", "head")));
+  throw new Error("unknown team command; run `neuromem --help`");
 }
 
 function required(name: string): string {

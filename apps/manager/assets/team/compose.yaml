@@ -1,0 +1,212 @@
+name: ${COMPOSE_PROJECT_NAME:-neuromem-team}
+
+services:
+  control-database:
+    image: postgres:15-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${CONTROL_POSTGRES_DB:?CONTROL_POSTGRES_DB is required}
+      POSTGRES_USER: ${CONTROL_POSTGRES_USER:?CONTROL_POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${CONTROL_POSTGRES_PASSWORD:?CONTROL_POSTGRES_PASSWORD is required}
+    volumes:
+      - control-database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [backend]
+
+  memory-database:
+    image: pgvector/pgvector:0.8.6-pg15
+    restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: ${MEMORY_POSTGRES_DB:?MEMORY_POSTGRES_DB is required}
+      POSTGRES_USER: ${MEMORY_POSTGRES_USER:?MEMORY_POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${MEMORY_POSTGRES_PASSWORD:?MEMORY_POSTGRES_PASSWORD is required}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - memory-database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [backend]
+
+  memory-redis:
+    image: redis:8.2-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${MEMORY_REDIS_PASSWORD:?MEMORY_REDIS_PASSWORD is required}", "--appendonly", "yes"]
+    volumes:
+      - memory-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$MEMORY_REDIS_PASSWORD ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      MEMORY_REDIS_PASSWORD: ${MEMORY_REDIS_PASSWORD:?MEMORY_REDIS_PASSWORD is required}
+    networks: [backend]
+
+  memory-core:
+    image: ${MEMORY_CORE_IMAGE:?MEMORY_CORE_IMAGE digest is required}
+    labels:
+      org.opencontainers.image.source: ${MEMORY_CORE_SOURCE_URL:?MEMORY_CORE_SOURCE_URL is required}
+      org.opencontainers.image.revision: ${MEMORY_CORE_SOURCE_REVISION:?MEMORY_CORE_SOURCE_REVISION is required}
+    restart: unless-stopped
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    environment: &memory-environment
+      DB_CONNECTION_URI: postgresql+psycopg://${MEMORY_POSTGRES_USER}:${MEMORY_POSTGRES_PASSWORD}@memory-database:5432/${MEMORY_POSTGRES_DB}
+      CACHE_URL: redis://:${MEMORY_REDIS_PASSWORD}@memory-redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+      AUTH_USE_AUTH: "true"
+      AUTH_JWT_SECRET: ${MEMORY_AUTH_JWT_SECRET:?MEMORY_AUTH_JWT_SECRET is required}
+      NEUROMEM_INTERNAL_SIGNING_KEY: ${MEMORY_INTERNAL_SIGNING_KEY:?MEMORY_INTERNAL_SIGNING_KEY is required}
+      EMBEDDING_MODEL_CONFIG__TRANSPORT: openai
+      EMBEDDING_MODEL_CONFIG__MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: ${EMBEDDING_BASE_URL}
+      EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_VECTOR_DIMENSIONS: ${EMBEDDING_VECTOR_DIMENSIONS:-1536}
+      DERIVER_MODEL_CONFIG__TRANSPORT: openai
+      DERIVER_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
+      DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
+      DERIVER_MODEL_CONFIG__OVERRIDES__API_KEY: ${GENERATION_API_KEY}
+      SUMMARY_MODEL_CONFIG__TRANSPORT: openai
+      SUMMARY_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
+      SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
+      SUMMARY_MODEL_CONFIG__OVERRIDES__API_KEY: ${GENERATION_API_KEY}
+      DREAM_DEDUCTION_MODEL_CONFIG__TRANSPORT: openai
+      DREAM_DEDUCTION_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
+      DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
+      DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__API_KEY: ${GENERATION_API_KEY}
+      DREAM_INDUCTION_MODEL_CONFIG__TRANSPORT: openai
+      DREAM_INDUCTION_MODEL_CONFIG__MODEL: ${GENERATION_MODEL}
+      DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${GENERATION_BASE_URL}
+      DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__API_KEY: ${GENERATION_API_KEY}
+    depends_on:
+      memory-database: { condition: service_healthy }
+      memory-redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [backend]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  memory-worker:
+    image: ${MEMORY_CORE_IMAGE:?MEMORY_CORE_IMAGE digest is required}
+    labels:
+      org.opencontainers.image.source: ${MEMORY_CORE_SOURCE_URL:?MEMORY_CORE_SOURCE_URL is required}
+      org.opencontainers.image.revision: ${MEMORY_CORE_SOURCE_REVISION:?MEMORY_CORE_SOURCE_REVISION is required}
+    restart: unless-stopped
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    environment: *memory-environment
+    depends_on:
+      memory-core: { condition: service_healthy }
+    networks: [backend]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  control:
+    image: ${CONTROL_IMAGE:-neuromem-control:local}
+    build:
+      context: ${CONTROL_BUILD_CONTEXT:-../../apps/control}
+    restart: unless-stopped
+    environment:
+      NEUROMEM_CONTROL_DATABASE_URL: postgresql+psycopg://${CONTROL_POSTGRES_USER}:${CONTROL_POSTGRES_PASSWORD}@control-database:5432/${CONTROL_POSTGRES_DB}
+      NEUROMEM_CONTROL_TOKEN_PEPPER: ${CONTROL_TOKEN_PEPPER:?CONTROL_TOKEN_PEPPER is required}
+      NEUROMEM_CONTROL_SECRET_KEY: ${CONTROL_TOKEN_PEPPER:?CONTROL_TOKEN_PEPPER is required}
+      NEUROMEM_CONTROL_INTERNAL_SIGNING_KEY: ${CONTROL_INTERNAL_SIGNING_KEY:?CONTROL_INTERNAL_SIGNING_KEY is required}
+      NEUROMEM_CONTROL_MEMORY_CORE_URL: http://memory-core:8000
+      NEUROMEM_PUBLIC_BASE_URL: https://${NEUROMEM_PUBLIC_HOST:?NEUROMEM_PUBLIC_HOST is required}
+      NEUROMEM_TRUSTED_PROXY_COUNT: "1"
+    depends_on:
+      control-database: { condition: service_healthy }
+      memory-core: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [frontend, backend]
+
+  mcp:
+    image: ${MCP_IMAGE:-neuromem-mcp:local}
+    build:
+      context: ${MCP_BUILD_CONTEXT:-../../apps/mcp}
+    restart: unless-stopped
+    environment:
+      PORT: 3001
+      HOST: 0.0.0.0
+      NEUROMEM_CONTROL_API_URL: http://control:8000
+      NEUROMEM_MCP_AUTH_MODE: team
+      NEUROMEM_MCP_ALLOW_REMOTE: "true"
+      NEUROMEM_NODE_ID: team-memory
+      NEUROMEM_NODE_ALIAS: team
+      NEUROMEM_CORE_URL: http://memory-core:8000
+      NEUROMEM_CORE_TOKEN: ${MEMORY_CORE_SERVICE_TOKEN:?MEMORY_CORE_SERVICE_TOKEN is required}
+      NEUROMEM_PUBLIC_HOST: ${NEUROMEM_PUBLIC_HOST:?NEUROMEM_PUBLIC_HOST is required}
+      NEUROMEM_MCP_STATE_DIR: /var/lib/neuromem-mcp
+    volumes:
+      - mcp-state:/var/lib/neuromem-mcp
+    depends_on:
+      control: { condition: service_healthy }
+    networks: [frontend, backend]
+
+  web:
+    image: ${WEB_IMAGE:-neuromem-web:local}
+    build:
+      context: ${WEB_BUILD_CONTEXT:-../../apps/web}
+    restart: unless-stopped
+    environment:
+      CORE_API_UPSTREAM: http://control:8000/api
+      CORE_API_TOKEN: unused-team-edge-session
+    depends_on:
+      control: { condition: service_healthy }
+    networks: [frontend]
+
+  edge:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${EDGE_LOOPBACK_PORT:-24443}:8080"
+    depends_on:
+      control: { condition: service_healthy }
+      mcp: { condition: service_started }
+      web: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [frontend]
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.8.1
+    profiles: [cloudflare]
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:-not-configured}"]
+    depends_on:
+      edge: { condition: service_healthy }
+    networks: [frontend]
+
+volumes:
+  control-database-data:
+    name: ${CONTROL_DB_VOLUME:?CONTROL_DB_VOLUME is required}
+  memory-database-data:
+    name: ${MEMORY_DB_VOLUME:?MEMORY_DB_VOLUME is required}
+  memory-redis-data:
+    name: ${MEMORY_REDIS_VOLUME:?MEMORY_REDIS_VOLUME is required}
+  mcp-state:
+    name: ${MCP_STATE_VOLUME:?MCP_STATE_VOLUME is required}
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
