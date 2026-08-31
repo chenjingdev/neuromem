@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeManagerBootstrap,
   managerApi,
+  teamApi,
   normalizeBackup,
   normalizeBacklog,
   normalizeGraph,
@@ -127,5 +128,53 @@ describe("API response normalization", () => {
     expect(localStorage.getItem("neuromem-admin")).toBeNull();
     expect(sessionStorage.getItem("neuromem-admin")).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:14174/v1/admin/session", expect.objectContaining({ credentials: "include", body: JSON.stringify({ token: "one-time-secret" }) }));
+  });
+});
+
+describe("team product API", () => {
+  it("loads team, peer, credential, grant, federation, and transfer data through the product session", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      let body: unknown = { items: [] };
+      if (url.endsWith("/workspaces/workspace-1/members")) body = [{ id: "member-1", workspace_id: "workspace-1", principal_id: "principal-1", role: "owner", status: "active" }];
+      else if (url.endsWith("/workspaces/workspace-1/peer-bindings")) body = [{ principal_id: "principal-1", peer: { id: "human-1", workspace_id: "workspace-1", name: "Aram", kind: "human", status: "active" }, kind: "primary_human", status: "active" }, { principal_id: null, peer: { id: "agent-1", workspace_id: "workspace-1", name: "Aram Codex", kind: "agent", status: "active" }, kind: "agent_owner", client: "codex", owner_principal_id: "principal-1", status: "active" }];
+      else if (url.endsWith("/credentials")) body = [{ id: "credential-1", name: "Codex", token_prefix: "nmem_1234", kind: "mcp", workspace_id: "workspace-1", project_ids: ["project-1"], principal_id: "principal-1", agent_peer_id: "agent-1", capabilities: ["memory:read"] }];
+      else if (url.endsWith("/projects/project-1/grants")) body = { items: [{ id: "grant-1", project_id: "project-1", principal_id: "principal-1", capabilities: ["memory:read"] }] };
+      else if (url.endsWith("/workspace-links")) body = [{ id: "link-1", source_workspace_id: "workspace-1", target_workspace_id: "workspace-2", status: "active" }];
+      else if (url.endsWith("/federated-project-grants")) body = [{ id: "fgrant-1", workspace_link_id: "link-1", source_project_id: "external-project", target_workspace_id: "workspace-1", capabilities: ["search"], status: "active" }];
+      else if (url.includes("/transfer-requests?")) body = [{ id: "transfer-1", source_workspace_id: "workspace-2", source_project_id: "external-project", target_workspace_id: "workspace-1", target_project_id: "project-1", source_record_id: "record-1", provenance: { reason: "approved context" }, status: "pending_target" }];
+      else throw new Error(`Unexpected URL ${url}`);
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const dashboard = await teamApi.dashboard({ workspaceId: "workspace-1", projectId: "project-1" });
+    expect(dashboard.members[0]).toMatchObject({ display_name: "Aram", agent_peers: [{ client: "codex" }] });
+    expect(dashboard.peer_bindings[0].agent_peers[0]).toMatchObject({ client: "codex" });
+    expect(dashboard.credentials[0]).toMatchObject({ human_peer_id: "human-1", agent_peer_id: "agent-1" });
+    expect(dashboard.transfer_requests[0]).toMatchObject({ status: "pending_target" });
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+    expect(fetchMock.mock.calls.every(call => call[1]?.credentials === "include" && (call[1]?.headers as Record<string, string>)["x-neuromem-workspace"] === "workspace-1")).toBe(true);
+    expect(fetchMock.mock.calls.map(call => String(call[0]))).toEqual(expect.arrayContaining([
+      expect.stringMatching(/\/api\/v1\/workspaces\/workspace-1\/members$/),
+      expect.stringMatching(/\/api\/v1\/projects\/project-1\/grants$/),
+    ]));
+  });
+
+  it("creates a credential and resolves a transfer without placing secrets in URLs", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => new Response(JSON.stringify(
+      String(input).includes("transfer-1")
+        ? { id: "transfer-1", status: "approved" }
+        : { credential: { id: "credential-1", name: "Aram Codex", token_prefix: "nmem_1234", kind: "mcp", workspace_id: "workspace-1", project_ids: ["project-1"], principal_id: "principal-1", agent_peer_id: "agent-1", capabilities: ["memory:read"] }, token: "one-time-secret" },
+    ), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(teamApi.createCredential({ workspace_id: "workspace-1", project_id: "project-1", name: "Aram Codex", client: "codex", agent_peer_id: "agent-1", capabilities: ["memory:read"] })).resolves.toMatchObject({ secret: "one-time-secret" });
+    await teamApi.resolveTransferRequest({ workspaceId: "workspace-1", projectId: "project-1" }, "transfer-1", "approve");
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/\/api\/v1\/credentials$/);
+    expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("one-time-secret");
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST", credentials: "include" });
+    expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(/\/api\/v1\/transfer-requests\/transfer-1:approve$/);
   });
 });

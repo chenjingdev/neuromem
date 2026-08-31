@@ -1,5 +1,6 @@
 import type {
   Backup,
+  ApiCredential,
   Claim,
   ClaimEvidence,
   KnowledgeGraph,
@@ -17,6 +18,15 @@ import type {
   RecallResult,
   RecordContext,
   Scope,
+  CreatedCredential,
+  FederatedProjectGrant,
+  PeerBinding,
+  ProjectGrant,
+  TeamDashboard,
+  TransferRequest,
+  WorkspaceLink,
+  WorkspaceMember,
+  WorkspaceRole,
   WikiDocument,
   WorkspaceOption,
 } from "./types";
@@ -32,6 +42,7 @@ export class ApiError extends Error {
 }
 
 const coreBase = trimBase(import.meta.env.VITE_CORE_API_URL || "/core-api");
+const teamBase = trimBase(import.meta.env.VITE_TEAM_API_URL || "/api");
 let managerBase = trimBase(import.meta.env.VITE_MANAGER_API_URL || "http://127.0.0.1:14174");
 
 function trimBase(value: string) {
@@ -68,6 +79,16 @@ async function request<T>(base: string, path: string, init: RequestInit & { mana
 }
 
 const json = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });
+const patchJson = (body: unknown): RequestInit => ({ method: "PATCH", body: JSON.stringify(body) });
+const deleteRequest = (): RequestInit => ({ method: "DELETE" });
+const teamHeaders = (workspaceId: string, projectId?: string): Record<string, string> => ({
+  "x-neuromem-workspace": workspaceId,
+  ...(projectId ? { "x-neuromem-project": projectId } : {}),
+});
+
+function listItems<T>(payload: { items?: T[] } | T[]): T[] {
+  return Array.isArray(payload) ? payload : payload.items || [];
+}
 
 interface RawRecord {
   id: string;
@@ -76,6 +97,56 @@ interface RawRecord {
   occurred_at: string;
   source_app?: string | null;
   project_id: string;
+}
+
+interface RawMembership {
+  id: string;
+  workspace_id: string;
+  principal_id: string;
+  role: WorkspaceRole;
+  status: "active" | "inactive";
+}
+
+interface RawPeerBinding {
+  principal_id: string | null;
+  peer: { id: string; workspace_id: string; name: string; kind: string; status: string };
+  kind: string;
+  client?: string | null;
+  owner_principal_id?: string | null;
+  owner_workspace_id?: string | null;
+  status: string;
+}
+
+interface RawCredential {
+  id: string;
+  principal_id: string;
+  workspace_id: string;
+  agent_peer_id?: string | null;
+  name: string;
+  kind: string;
+  token_prefix: string;
+  capabilities: string[];
+  project_ids: string[];
+  expires_at?: string | null;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+}
+
+interface RawTransfer {
+  id: string;
+  source_workspace_id: string;
+  source_project_id: string;
+  target_workspace_id: string;
+  target_project_id: string;
+  requested_by_principal_id?: string;
+  source_record_id: string;
+  source_content_hash?: string;
+  source_snapshot?: string;
+  reviewed_content?: string | null;
+  provenance?: Record<string, unknown>;
+  status: string;
+  rejection_reason?: string | null;
+  created_at?: string;
 }
 
 interface RawClaim {
@@ -173,6 +244,182 @@ export const coreApi = {
     workspace_id: scope.workspaceId,
     project_id: scope.projectId,
   })),
+};
+
+function normalizePeerBindings(rows: RawPeerBinding[], workspaceId: string): PeerBinding[] {
+  const grouped = new Map<string, PeerBinding>();
+  for (const row of rows) {
+    if (row.kind === "primary_human" && row.principal_id) {
+      const existing = grouped.get(row.principal_id);
+      grouped.set(row.principal_id, {
+        principal_id: row.principal_id,
+        display_name: row.peer.name,
+        human_peer_id: row.peer.id,
+        human_peer_status: row.status === "inactive" ? "inactive" : "active",
+        agent_peers: existing?.agent_peers || [],
+      });
+    }
+  }
+  for (const row of rows) {
+    if (row.kind !== "agent_owner") continue;
+    const ownerKey = row.owner_principal_id || `workspace:${row.owner_workspace_id || workspaceId}`;
+    const existing = grouped.get(ownerKey) || {
+      principal_id: ownerKey,
+      display_name: row.owner_principal_id ? row.owner_principal_id : "Workspace 공용 Agent",
+      human_peer_id: "",
+      human_peer_status: "active" as const,
+      agent_peers: [],
+    };
+    existing.agent_peers.push({
+      id: row.peer.id,
+      name: row.peer.name,
+      client: row.client || "custom",
+      owner_principal_id: row.owner_principal_id || undefined,
+      owner_workspace_id: row.owner_workspace_id || undefined,
+      status: row.status === "inactive" ? "inactive" : "active",
+    });
+    grouped.set(ownerKey, existing);
+  }
+  return [...grouped.values()];
+}
+
+function normalizeCredential(raw: RawCredential): ApiCredential {
+  return {
+    id: raw.id,
+    name: raw.name,
+    prefix: raw.token_prefix,
+    workspace_id: raw.workspace_id,
+    project_id: raw.project_ids[0],
+    principal_id: raw.principal_id,
+    human_peer_id: "",
+    agent_peer_id: raw.agent_peer_id || undefined,
+    capabilities: raw.capabilities,
+    expires_at: raw.expires_at || undefined,
+    last_used_at: raw.last_used_at || undefined,
+    revoked_at: raw.revoked_at || undefined,
+  };
+}
+
+function normalizeTransfer(raw: RawTransfer): TransferRequest {
+  return {
+    id: raw.id,
+    source_workspace_id: raw.source_workspace_id,
+    source_project_id: raw.source_project_id,
+    target_workspace_id: raw.target_workspace_id,
+    target_project_id: raw.target_project_id,
+    record_ids: [raw.source_record_id],
+    reason: typeof raw.provenance?.reason === "string" ? raw.provenance.reason : raw.rejection_reason || "기억 이관 요청",
+    status: raw.status,
+    requested_by: raw.requested_by_principal_id,
+    created_at: raw.created_at,
+  };
+}
+
+/** Workspace product APIs. These always use the browser's product session;
+ * host/node administration remains isolated in managerApi. */
+export const teamApi = {
+  members: async (workspaceId: string) => listItems(await request<{ items?: RawMembership[] } | RawMembership[]>(
+    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members`, { credentials: "include", headers: teamHeaders(workspaceId) },
+  )).map((member): WorkspaceMember => ({
+    ...member, display_name: member.principal_id, human_peer_id: "", human_peer_status: member.status,
+    agent_peers: [],
+  })),
+  inviteMember: async (workspaceId: string, input: { email: string; role: WorkspaceRole }) => {
+    const result = await request<{ invitation: { id: string; expires_at: string }; token: string }>(
+      teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/invitations`, { ...json(input), credentials: "include", headers: teamHeaders(workspaceId) },
+    );
+    return { invitation_id: result.invitation.id, invite_url: result.token, expires_at: result.invitation.expires_at };
+  },
+  updateMember: (workspaceId: string, memberId: string, input: { role?: WorkspaceRole; status?: "active" | "inactive" }) => request<RawMembership>(
+    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`, { ...patchJson(input), credentials: "include", headers: teamHeaders(workspaceId) },
+  ),
+  peerBindings: async (workspaceId: string): Promise<PeerBinding[]> => normalizePeerBindings(listItems(await request<{ items?: RawPeerBinding[] } | RawPeerBinding[]>(
+    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/peer-bindings`, { credentials: "include", headers: teamHeaders(workspaceId) },
+  )), workspaceId),
+  credentials: async (workspaceId: string) => listItems(await request<{ items?: RawCredential[] } | RawCredential[]>(
+    teamBase, "/v1/credentials", { credentials: "include", headers: teamHeaders(workspaceId) },
+  )).map(normalizeCredential),
+  createCredential: (input: {
+    workspace_id: string;
+    project_id?: string;
+    name: string;
+    client: "codex" | "claude" | "custom";
+    agent_peer_id?: string;
+    capabilities: string[];
+  }) => request<{ credential: RawCredential; token: string }>(teamBase, "/v1/credentials", {
+    ...json({ name: input.name, kind: "mcp", agent_peer_id: input.agent_peer_id, capabilities: input.capabilities, project_ids: input.project_id ? [input.project_id] : [] }),
+    credentials: "include", headers: teamHeaders(input.workspace_id, input.project_id),
+  }).then((result): CreatedCredential => ({ credential: normalizeCredential(result.credential), secret: result.token })),
+  revokeCredential: (scope: Scope, credentialId: string) => request<void>(
+    teamBase, `/v1/credentials/${encodeURIComponent(credentialId)}`, { ...deleteRequest(), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  projectGrants: async (scope: Scope) => listItems(await request<{ items?: ProjectGrant[] } | ProjectGrant[]>(
+    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+  )),
+  createProjectGrant: (scope: Scope, input: { principal_id: string; capabilities: string[] }) => request<ProjectGrant>(
+    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { ...json(input), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  revokeProjectGrant: (scope: Scope, grantId: string) => request<void>(
+    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants/${encodeURIComponent(grantId)}`, { ...deleteRequest(), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  workspaceLinks: async (workspaceId: string) => listItems(await request<{ items?: WorkspaceLink[] } | WorkspaceLink[]>(
+    teamBase, "/v1/workspace-links", { credentials: "include", headers: teamHeaders(workspaceId) },
+  )),
+  createWorkspaceLink: (input: { source_workspace_id: string; target_workspace_id: string }) => request<WorkspaceLink>(
+    teamBase, "/v1/workspace-links", { ...json(input), credentials: "include", headers: teamHeaders(input.source_workspace_id) },
+  ),
+  approveWorkspaceLink: (workspaceId: string, linkId: string) => request<WorkspaceLink>(
+    teamBase, `/v1/workspace-links/${encodeURIComponent(linkId)}:approve`, { ...json({}), credentials: "include", headers: teamHeaders(workspaceId) },
+  ),
+  federatedGrants: async (workspaceId: string) => listItems(await request<{ items?: FederatedProjectGrant[] } | FederatedProjectGrant[]>(
+    teamBase, "/v1/federated-project-grants", { credentials: "include", headers: teamHeaders(workspaceId) },
+  )),
+  createFederatedGrant: (workspaceId: string, input: {
+    workspace_link_id: string;
+    source_project_id: string;
+    capabilities: Array<"search" | "read_source">;
+  }) => request<FederatedProjectGrant>(teamBase, "/v1/federated-project-grants", { ...json(input), credentials: "include", headers: teamHeaders(workspaceId) }),
+  transferRequests: async (workspaceId: string) => listItems(await request<{ items?: RawTransfer[] } | RawTransfer[]>(
+    teamBase, `/v1/transfer-requests?workspace_id=${encodeURIComponent(workspaceId)}`, { credentials: "include", headers: teamHeaders(workspaceId) },
+  )).map(normalizeTransfer),
+  resolveTransferRequest: (scope: Scope, requestId: string, decision: "approve" | "reject") => request<RawTransfer>(
+    teamBase, `/v1/transfer-requests/${encodeURIComponent(requestId)}:${decision}`, {
+      ...json(decision === "approve" ? {} : { reason: "Workspace 관리자가 이관을 거절했습니다." }),
+      credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId),
+    },
+  ).then(normalizeTransfer),
+  dashboard: async (scope: Scope): Promise<TeamDashboard> => {
+    const [members, peerBindings, credentials, projectGrants, workspaceLinks, federatedGrants, transferRequests] = await Promise.all([
+      teamApi.members(scope.workspaceId),
+      teamApi.peerBindings(scope.workspaceId),
+      teamApi.credentials(scope.workspaceId),
+      teamApi.projectGrants(scope),
+      teamApi.workspaceLinks(scope.workspaceId),
+      teamApi.federatedGrants(scope.workspaceId),
+      teamApi.transferRequests(scope.workspaceId),
+    ]);
+    return {
+      members: members.map(member => {
+        const binding = peerBindings.find(item => item.principal_id === member.principal_id);
+        return {
+          ...member,
+          display_name: binding?.display_name || member.display_name,
+          human_peer_id: binding?.human_peer_id || member.human_peer_id,
+          human_peer_status: binding?.human_peer_status || member.human_peer_status,
+          agent_peers: binding?.agent_peers || [],
+        };
+      }),
+      peer_bindings: peerBindings,
+      credentials: credentials.map(credential => ({
+        ...credential,
+        human_peer_id: peerBindings.find(item => item.principal_id === credential.principal_id)?.human_peer_id || "",
+      })),
+      project_grants: projectGrants,
+      workspace_links: workspaceLinks,
+      federated_grants: federatedGrants,
+      transfer_requests: transferRequests,
+    };
+  },
 };
 
 export const managerApi = {

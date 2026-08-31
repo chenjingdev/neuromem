@@ -13,7 +13,9 @@ import {
   FederatedMemoryRouter,
   loadRouterConfig,
   MEMORY_TOOLS,
+  TEAM_MEMORY_TOOLS,
   MemoryToolDispatcher,
+  type AuthContext,
   type FederatedResult,
   type JsonObject,
   uuid7
@@ -25,6 +27,18 @@ const SESSION_ID = "018f0f86-4d67-7a3c-8f2c-123456789abc";
 const RECORD_ID = "018f0f86-4d68-7a3c-8f2c-123456789abc";
 const CLAIM_ID = "018f0f86-4d69-7a3c-8f2c-123456789abc";
 const LOGICAL_SCOPE = { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID };
+const HUMAN_PEER_ID = "018f0f86-4d71-7a3c-8f2c-123456789abc";
+const AGENT_PEER_ID = "018f0f86-4d72-7a3c-8f2c-123456789abc";
+const TEAM_AUTH: AuthContext = {
+  principal_id: "018f0f86-4d73-7a3c-8f2c-123456789abc",
+  credential_id: "018f0f86-4d74-7a3c-8f2c-123456789abc",
+  workspace_id: WORKSPACE_ID,
+  project_id: PROJECT_ID,
+  human_peer_id: HUMAN_PEER_ID,
+  agent_peer_id: AGENT_PEER_ID,
+  capabilities: ["*"],
+  client: "codex"
+};
 
 interface CapturedRequest {
   method: string;
@@ -111,6 +125,76 @@ test("the dispatcher exposes exactly the eight final memory tools", () => {
     const required = tool.inputSchema.required as string[];
     return required.includes("workspace_id") && required.includes("project_id");
   }));
+});
+
+test("team mode derives scope and author Peers from the credential and applies safe context defaults", async (context) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "neuromem-mcp-team-test-"));
+  const node = await mockNode((request) => {
+    if (request.path === "/v1/records:batch") return { status: 201, body: { records: [] } };
+    if (request.path === "/v1/recall") return {
+      body: {
+        records: [{ record_id: RECORD_ID, content: "shared result", rank: 1, source_workspace_id: "external-workspace", source_project_id: "external-project", source_peer_id: HUMAN_PEER_ID, grant_id: "grant-1" }],
+        claims: [], record_snippets: [], embedding_used: true
+      }
+    };
+    if (request.path === "/v1/transfer-requests") return { body: { id: "transfer-1", status: "pending_source" } };
+    return { status: 404 };
+  });
+  context.after(async () => { await node.close(); await rm(stateDir, { recursive: true, force: true }); });
+  const dispatcher = new MemoryToolDispatcher(new FederatedMemoryRouter({
+    nodes: [{ id: "gateway", baseUrl: node.baseUrl, token: "gateway-token-0123456789abcdefghijkl" }],
+    stateDir
+  }), { authMode: "team", authContext: TEAM_AUTH });
+
+  assert.equal(TEAM_MEMORY_TOOLS.length, 16);
+  const recordSchema = dispatcher.listTools().find((tool) => tool.name === "memory_record")!.inputSchema;
+  assert.equal("workspace_id" in (recordSchema.properties as JsonObject), false);
+  assert.equal("author_key" in (recordSchema.properties as JsonObject), false);
+
+  await dispatcher.callTool("memory_record", { session_id: SESSION_ID, speaker: "agent", content: "credential-bound agent message" });
+  const written = (node.requests[0]?.body?.records as JsonObject[])[0]!;
+  assert.equal(node.requests[0]?.body?.workspace_id, WORKSPACE_ID);
+  assert.equal(node.requests[0]?.body?.project_id, PROJECT_ID);
+  assert.equal(written.author_key, AGENT_PEER_ID);
+  assert.equal(written.author_kind, "agent");
+  assert.equal(written.source_app, "codex");
+
+  const recalled = await dispatcher.callTool("recall", { query: "shared" }) as FederatedResult;
+  assert.deepEqual(node.requests[1]?.body, {
+    workspace_id: WORKSPACE_ID, project_id: PROJECT_ID, query: "shared", include: ["records", "claims"], limit: 10,
+    include_general: true, include_federated: false
+  });
+  assert.equal(recalled.results[0]?.source_workspace_id, "external-workspace");
+  assert.equal(recalled.results[0]?.source_project_id, "external-project");
+  assert.equal(recalled.results[0]?.source_peer_id, HUMAN_PEER_ID);
+  assert.equal(recalled.results[0]?.grant_id, "grant-1");
+
+  await dispatcher.callTool("transfer_request", {
+    target_workspace_id: "018f0f86-4d76-7a3c-8f2c-123456789abc",
+    target_project_id: "018f0f86-4d77-7a3c-8f2c-123456789abc",
+    record_id: RECORD_ID,
+    source_content_hash: "a".repeat(64),
+    source_snapshot: "approved source snapshot",
+    reason: "share the accepted architecture"
+  });
+  assert.deepEqual(node.requests[2]?.body, {
+    source_workspace_id: WORKSPACE_ID,
+    source_project_id: PROJECT_ID,
+    target_workspace_id: "018f0f86-4d76-7a3c-8f2c-123456789abc",
+    target_project_id: "018f0f86-4d77-7a3c-8f2c-123456789abc",
+    source_record_id: RECORD_ID,
+    source_content_hash: "a".repeat(64),
+    source_snapshot: "approved source snapshot",
+    provenance: { reason: "share the accepted architecture" }
+  });
+
+  await assert.rejects(dispatcher.callTool("memory_record", {
+    workspace_id: "018f0f86-4d75-7a3c-8f2c-123456789abc",
+    session_id: SESSION_ID, speaker: "agent", content: "spoof"
+  }), /unknown argument 'workspace_id'/);
+  await assert.rejects(new MemoryToolDispatcher(dispatcher.router, {
+    authMode: "team", authContext: { ...TEAM_AUTH, capabilities: ["project.read"] }
+  }).callTool("memory_record", { session_id: SESSION_ID, speaker: "agent", content: "forbidden" }), /lacks 'project.write'/);
 });
 
 test("memory_record sends the exact batch shape with one UUIDv7 across nodes", async (context) => {

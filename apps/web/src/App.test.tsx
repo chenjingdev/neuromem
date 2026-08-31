@@ -40,6 +40,37 @@ describe("Neuromem web routes", () => {
     expect(screen.getByRole("button", { name: "바로 시작" })).toBeInTheDocument();
   });
 
+  it("keeps Workspace team and Peer management in the product UI, separate from host Admin", async () => {
+    window.history.replaceState(null, "", "/app/team");
+    const mutationCalls: string[] = [];
+    mockFetch((url, init) => {
+      if (url.endsWith("/core-api/v1/workspaces")) return { items: [workspace] };
+      if (url.includes("/core-api/v1/workspaces/workspace-1/projects")) return { items: [project] };
+      if (url.endsWith("/api/v1/workspaces/workspace-1/members")) return [{ id: "member-1", workspace_id: workspace.id, principal_id: "principal-1", role: "owner", status: "active" }];
+      if (url.endsWith("/api/v1/workspaces/workspace-1/peer-bindings")) return [{ principal_id: "principal-1", peer: { id: "018f0f86-4d65-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람", kind: "human", status: "active" }, kind: "primary_human", status: "active" }, { principal_id: null, peer: { id: "018f0f86-4d66-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람 Codex", kind: "agent", status: "active" }, kind: "agent_owner", client: "codex", owner_principal_id: "principal-1", status: "active" }, { principal_id: null, peer: { id: "018f0f86-4d67-7a3c-8f2c-123456789abc", workspace_id: workspace.id, name: "아람 Claude", kind: "agent", status: "active" }, kind: "agent_owner", client: "claude", owner_principal_id: "principal-1", status: "active" }];
+      if (url.endsWith("/api/v1/credentials")) return [{ id: "credential-1", name: "Codex MCP", token_prefix: "nmem_abcd", kind: "mcp", workspace_id: workspace.id, project_ids: [project.id], principal_id: "principal-1", agent_peer_id: "018f0f86-4d66-7a3c-8f2c-123456789abc", capabilities: ["memory:read"] }];
+      if (url.endsWith("/api/v1/projects/project-1/grants")) return { items: [] };
+      if (url.endsWith("/api/v1/workspace-links")) return [];
+      if (url.endsWith("/api/v1/federated-project-grants")) return [];
+      if (url.includes("/api/v1/transfer-requests?")) return [{ id: "transfer-1", source_workspace_id: "workspace-2", source_project_id: "project-2", target_workspace_id: workspace.id, target_project_id: project.id, source_record_id: "record-1", provenance: { reason: "공유 승인된 설계 결정" }, status: "pending_target", created_at: "2026-08-31T00:00:00Z" }];
+      if (url.endsWith("/api/v1/transfer-requests/transfer-1:approve") && init?.method === "POST") { mutationCalls.push(url); return { id: "transfer-1", source_workspace_id: "workspace-2", source_project_id: "project-2", target_workspace_id: workspace.id, target_project_id: project.id, source_record_id: "record-1", provenance: { reason: "공유 승인된 설계 결정" }, status: "approved" }; }
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "팀 관리" })).toBeInTheDocument();
+    expect(screen.getByText(/호스트 운영자 권한과 연결되지 않습니다/)).toBeInTheDocument();
+    expect(screen.getByText("Human Peer")).toBeInTheDocument();
+    expect(screen.getByText("아람 Codex")).toBeInTheDocument();
+    expect(screen.getByText("아람 Claude")).toBeInTheDocument();
+    expect(screen.getByText("공유 승인된 설계 결정")).toBeInTheDocument();
+    expect(screen.queryByText("Node 관리")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "승인" }));
+    await waitFor(() => expect(mutationCalls).toHaveLength(1));
+    expect(await screen.findByText("이관 요청을 승인했습니다.")).toBeInTheDocument();
+  });
+
   it("renders an accessible graph and drills from a relation into record evidence", async () => {
     window.history.replaceState(null, "", "/app/graph");
     mockFetch(url => {

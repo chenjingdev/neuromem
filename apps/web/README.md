@@ -1,7 +1,10 @@
 # Neuromem Web
 
 React/TypeScript UI for the product surface at `/app` and the machine-local
-Node operator surface at `/admin`.
+Node operator surface at `/admin`. `/app/team` manages Workspace members,
+Human/Agent Peer bindings, MCP credentials, Project grants, Workspace links,
+federated grants, and the audited transfer inbox. Host administration remains a
+separate session and route.
 
 ```sh
 npm install
@@ -15,3 +18,6 @@ and the production container inject `CORE_API_TOKEN` server-side; secrets are
 never compiled into the JavaScript bundle. Manager access uses the one-time
 fragment produced by `neuromem admin open`, exchanges it for an HttpOnly cookie,
 and removes the fragment immediately.
+
+Team product calls use `VITE_TEAM_API_URL` (default `/api`) with the product
+session cookie and `X-Neuromem-Workspace` / `X-Neuromem-Project` scope headers.

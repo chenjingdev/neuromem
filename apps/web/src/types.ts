@@ -18,6 +18,114 @@ export interface ProjectOption {
   name: string;
 }
 
+export type WorkspaceRole = "owner" | "admin" | "contributor" | "viewer";
+export type MemberStatus = "active" | "invited" | "inactive";
+export type PeerStatus = "active" | "inactive";
+
+export interface AgentPeerBinding {
+  id: string;
+  name?: string;
+  client: "codex" | "claude" | "custom" | string;
+  owner_principal_id?: string;
+  owner_workspace_id?: string;
+  status: PeerStatus;
+}
+
+export interface WorkspaceMember {
+  id: string;
+  principal_id: string;
+  display_name: string;
+  email?: string;
+  role: WorkspaceRole;
+  status: MemberStatus;
+  human_peer_id: string;
+  human_peer_status?: PeerStatus;
+  agent_peers: AgentPeerBinding[];
+}
+
+export interface ApiCredential {
+  id: string;
+  name: string;
+  prefix: string;
+  workspace_id: string;
+  project_id?: string;
+  principal_id: string;
+  human_peer_id: string;
+  agent_peer_id?: string;
+  capabilities: string[];
+  expires_at?: string;
+  last_used_at?: string;
+  revoked_at?: string;
+}
+
+export interface CreatedCredential {
+  credential: ApiCredential;
+  secret: string;
+}
+
+export interface ProjectGrant {
+  id: string;
+  project_id: string;
+  principal_id?: string;
+  role?: WorkspaceRole;
+  capabilities: string[];
+  created_at?: string;
+}
+
+export type WorkspaceLinkStatus = "proposed" | "active" | "rejected" | "revoked";
+
+export interface WorkspaceLink {
+  id: string;
+  source_workspace_id: string;
+  target_workspace_id: string;
+  target_workspace_name?: string;
+  status: WorkspaceLinkStatus;
+  proposed_by?: string;
+  created_at?: string;
+}
+
+export interface FederatedProjectGrant {
+  id: string;
+  workspace_link_id: string;
+  source_workspace_id: string;
+  source_project_id: string;
+  source_project_name?: string;
+  target_workspace_id: string;
+  capabilities: Array<"search" | "read_source" | string>;
+  status: "proposed" | "active" | "revoked" | string;
+}
+
+export interface TransferRequest {
+  id: string;
+  source_workspace_id: string;
+  source_project_id: string;
+  target_workspace_id: string;
+  target_project_id: string;
+  record_ids: string[];
+  reason: string;
+  status: "pending_source" | "pending_target" | "approved" | "rejected" | "completed" | string;
+  requested_by?: string;
+  created_at?: string;
+}
+
+export interface PeerBinding {
+  principal_id: string;
+  display_name?: string;
+  human_peer_id: string;
+  human_peer_status: PeerStatus;
+  agent_peers: AgentPeerBinding[];
+}
+
+export interface TeamDashboard {
+  members: WorkspaceMember[];
+  peer_bindings: PeerBinding[];
+  credentials: ApiCredential[];
+  project_grants: ProjectGrant[];
+  workspace_links: WorkspaceLink[];
+  federated_grants: FederatedProjectGrant[];
+  transfer_requests: TransferRequest[];
+}
+
 export interface ProcessingSummary {
   pending: number;
   running: number;

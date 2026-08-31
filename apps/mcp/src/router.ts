@@ -32,6 +32,8 @@ interface RecallInput extends JsonObject {
   query: string;
   targets?: string[];
   limit?: number;
+  include_general?: boolean;
+  include_federated?: boolean;
 }
 
 interface StoredWrite extends JsonObject {
@@ -373,7 +375,7 @@ export class FederatedMemoryRouter {
       query: input.query,
       include,
       limit,
-      ...optionalFields(input, ["session_id", "after", "before"])
+      ...optionalFields(input, ["session_id", "after", "before", "include_general", "include_federated"])
     };
     const included = new Set(include);
     return this.#federated(
@@ -436,6 +438,127 @@ export class FederatedMemoryRouter {
       undefined,
       { workspace_id: workspaceId, project_id: projectId },
       requireContainerArrays("nodes", "edges"),
+      { workspace_id: workspaceId, project_id: projectId }
+    );
+  }
+
+  async representationRead(
+    workspaceId: string,
+    projectId: string,
+    peerId: string,
+    includeGeneral = true,
+    targets?: string[]
+  ): Promise<FederatedResult> {
+    return this.#federated(
+      "GET",
+      `/v1/peers/${encodeURIComponent(peerId)}/representation`,
+      this.#selectTargets(targets, this.#defaultReadTargets),
+      50,
+      undefined,
+      { workspace_id: workspaceId, project_id: projectId, include_general: includeGeneral },
+      extractContainer,
+      { workspace_id: workspaceId, project_id: projectId }
+    );
+  }
+
+  async peerCardRead(
+    workspaceId: string,
+    projectId: string,
+    peerId: string,
+    includeGeneral = true,
+    targets?: string[]
+  ): Promise<FederatedResult> {
+    return this.#federated(
+      "GET",
+      `/v1/peers/${encodeURIComponent(peerId)}/card`,
+      this.#selectTargets(targets, this.#defaultReadTargets),
+      50,
+      undefined,
+      { workspace_id: workspaceId, project_id: projectId, include_general: includeGeneral },
+      extractContainer,
+      { workspace_id: workspaceId, project_id: projectId }
+    );
+  }
+
+  async sessionContextRead(
+    workspaceId: string,
+    projectId: string,
+    sessionId: string,
+    includeGeneral = true,
+    targets?: string[]
+  ): Promise<FederatedResult> {
+    return this.#federated(
+      "GET",
+      `/v1/sessions/${encodeURIComponent(sessionId)}/context`,
+      this.#selectTargets(targets, this.#defaultReadTargets),
+      50,
+      undefined,
+      { workspace_id: workspaceId, project_id: projectId, include_general: includeGeneral },
+      extractContainer,
+      { workspace_id: workspaceId, project_id: projectId }
+    );
+  }
+
+  async dynamicContext(input: JsonObject & {
+    workspace_id: string;
+    project_id: string;
+    query: string;
+    targets?: string[];
+  }): Promise<FederatedResult> {
+    const targets = this.#selectTargets(input.targets, this.#defaultReadTargets);
+    const body = {
+      ...input,
+      targets: undefined,
+      include_general: input.include_general ?? true,
+      include_federated: input.include_federated ?? false
+    };
+    return this.#federated(
+      "POST", "/v1/context", targets, 50, body, undefined, extractContainer,
+      { workspace_id: input.workspace_id, project_id: input.project_id }
+    );
+  }
+
+  async dialecticChat(input: JsonObject & {
+    workspace_id: string;
+    project_id: string;
+    query: string;
+    targets?: string[];
+  }): Promise<FederatedResult> {
+    const targets = this.#selectTargets(input.targets, this.#defaultReadTargets);
+    const body = {
+      ...input,
+      targets: undefined,
+      include_general: input.include_general ?? true,
+      include_federated: input.include_federated ?? false
+    };
+    return this.#federated(
+      "POST", "/v1/chat", targets, 50, body, undefined, extractContainer,
+      { workspace_id: input.workspace_id, project_id: input.project_id }
+    );
+  }
+
+  async scheduleDream(
+    workspaceId: string,
+    projectId: string,
+    input: JsonObject,
+    targets?: string[]
+  ): Promise<FederatedResult> {
+    return this.#federated(
+      "POST", "/v1/dreams", this.#selectTargets(targets, this.#defaultWriteTargets), 50,
+      { ...input, workspace_id: workspaceId, project_id: projectId }, undefined, extractContainer,
+      { workspace_id: workspaceId, project_id: projectId }
+    );
+  }
+
+  async createTransferRequest(
+    workspaceId: string,
+    projectId: string,
+    input: JsonObject,
+    targets?: string[]
+  ): Promise<FederatedResult> {
+    return this.#federated(
+      "POST", "/v1/transfer-requests", this.#selectTargets(targets, this.#defaultWriteTargets), 50,
+      { ...input, source_workspace_id: workspaceId, source_project_id: projectId }, undefined, extractContainer,
       { workspace_id: workspaceId, project_id: projectId }
     );
   }

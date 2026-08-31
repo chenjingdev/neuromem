@@ -1,6 +1,24 @@
 # `@neuromem/mcp`
 
-A dependency-free Node.js 20+ adapter that exposes eight memory tools and routes them to one or more Core REST nodes.
+A dependency-free Node.js 20+ adapter for both local Core routing and credential-bound team memory.
+
+## Team mode
+
+Team deployments point the adapter at Control and a Gateway/Core target:
+
+```text
+NEUROMEM_CONTROL_API_URL=http://control:8080
+NEUROMEM_MCP_AUTH_MODE=team
+NEUROMEM_CORE_URL=http://gateway:8081/api
+NEUROMEM_CORE_TOKEN=<internal Gateway token>
+NEUROMEM_MCP_ALLOW_REMOTE=true
+```
+
+Each incoming bearer credential is resolved through `GET /api/v1/me`. The returned `AuthContext` pins `principal_id`, `credential_id`, Workspace, Project, Human Peer, optional Agent Peer, capabilities, and request ID to the MCP session. A credential cannot be swapped after `initialize`, and tool arguments cannot choose another scope or author.
+
+Team mode exposes recording, source/conclusion recall, evidence, Representation, Peer Card, Session Context, Wiki, graph, Dynamic Context, Dialectic chat, Dream scheduling, explicitly granted federated search, and audited transfer requests. Recall defaults to `include_general=true` and `include_federated=false`. A record's `speaker` selects only between the credential-bound Human Peer and Agent Peer.
+
+For a fixed local development identity, `NEUROMEM_MCP_AUTH_CONTEXT` may contain the complete JSON `AuthContext`. If neither Control nor a static context is configured, the adapter retains its local routing contract.
 
 ## Configuration
 
@@ -29,7 +47,7 @@ Core requests time out after 120 seconds and responses are capped at 64 MiB by d
 
 Defaults intentionally select only `personal` when it exists, otherwise the first configured node. Set `target` to `personal`, `company`, or `both`, or configure defaults at the Router.
 
-## Tool and REST contract
+## Local tool and REST contract
 
 | Tool | Core REST call |
 |---|---|

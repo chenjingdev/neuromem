@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
 
-import { loadRouterConfig } from "./config.js";
+import { loadMcpAuthConfig, loadRouterConfig } from "./config.js";
 import { dispatchRpc, type JsonRpcRequest, RpcError, rpcErrorMessage, validJsonRpcId } from "./rpc.js";
 import { FederatedMemoryRouter } from "./router.js";
 import { MemoryToolDispatcher } from "./tools.js";
@@ -13,7 +13,8 @@ function emit(message: unknown): void {
 
 const router = new FederatedMemoryRouter(loadRouterConfig());
 await router.ready();
-const dispatcher = new MemoryToolDispatcher(router);
+const auth = loadMcpAuthConfig();
+const dispatcher = new MemoryToolDispatcher(router, { authMode: auth.mode, authContext: auth.context });
 router.startRetryWorker();
 let initialized = false;
 let processing = Promise.resolve();

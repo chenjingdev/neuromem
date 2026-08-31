@@ -3,22 +3,28 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 
-import { loadRouterConfig } from "./config.js";
+import { loadMcpAuthConfig, loadRouterConfig } from "./config.js";
 import { uuid7 } from "./ids.js";
 import { dispatchRpc, type JsonRpcRequest, RpcError, rpcErrorMessage, validJsonRpcId } from "./rpc.js";
 import { FederatedMemoryRouter } from "./router.js";
-import { MemoryToolDispatcher } from "./tools.js";
-import type { JsonObject } from "./types.js";
+import { MemoryToolDispatcher, type McpAuthMode } from "./tools.js";
+import type { AuthContext, CredentialResolver, JsonObject } from "./types.js";
 
 const managedRouters = new WeakMap<Server, FederatedMemoryRouter>();
 
 interface Session {
   lastSeenAt: number;
+  credentialId?: string;
+  dispatcher: MemoryToolDispatcher;
 }
 
 export interface McpHttpServerOptions {
   dispatcher: MemoryToolDispatcher;
-  bearerToken: string;
+  bearerToken?: string;
+  authContext?: AuthContext;
+  credentialResolver?: CredentialResolver;
+  authMode?: McpAuthMode;
+  allowRemoteAccess?: boolean;
   maxBodyBytes?: number;
   sessionTtlMs?: number;
   maxSessions?: number;
@@ -40,10 +46,11 @@ function isLoopbackHost(value: string): boolean {
   }
 }
 
-function validateBrowserOrigin(request: IncomingMessage): void {
+function validateBrowserOrigin(request: IncomingMessage, allowRemoteAccess = false): void {
   const host = headerValue(request.headers.host);
-  if (!host || !isLoopbackHost(host)) throw new HttpInputError(403, "loopback Host is required");
   const origin = headerValue(request.headers.origin);
+  if (allowRemoteAccess && !origin) return;
+  if (!host || !isLoopbackHost(host)) throw new HttpInputError(403, "loopback Host is required");
   if (!origin) return;
   try {
     const parsed = new URL(origin);
@@ -62,6 +69,29 @@ function tokenMatches(header: string | undefined, expected: string): boolean {
   const expectedHash = createHash("sha256").update(expected).digest();
   const providedHash = createHash("sha256").update(provided).digest();
   return timingSafeEqual(expectedHash, providedHash) && provided.length > 0;
+}
+
+function bearerValue(header: string | undefined): string | undefined {
+  const value = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
+  return value || undefined;
+}
+
+async function readBoundedJsonResponse(response: Response, maximum: number): Promise<unknown> {
+  if (!response.body) throw new Error("Control response has no body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maximum) { await reader.cancel(); throw new Error("Control response is too large"); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 function writeJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): void {
@@ -157,9 +187,10 @@ function boundBatchReplies(replies: JsonObject[]): JsonObject[] {
 }
 
 export function createMcpHttpServer(options: McpHttpServerOptions): Server {
-  if (Buffer.byteLength(options.bearerToken, "utf8") < 16) {
+  if (options.bearerToken !== undefined && Buffer.byteLength(options.bearerToken, "utf8") < 16) {
     throw new Error("NEUROMEM_MCP_TOKEN must be at least 16 bytes");
   }
+  if (!options.bearerToken && !options.credentialResolver) throw new Error("a bearer token or credential resolver is required");
   const maxBodyBytes = options.maxBodyBytes ?? 5 * 1_048_576;
   const sessionTtlMs = options.sessionTtlMs ?? 30 * 60_000;
   const maxSessions = options.maxSessions ?? 1_024;
@@ -177,21 +208,45 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
     }
   }
 
-  function requireSession(request: IncomingMessage): string {
+  function requireSession(request: IncomingMessage, credentialId?: string, dispatcher?: MemoryToolDispatcher): { id: string; session: Session } {
     pruneSessions();
     const id = headerValue(request.headers["mcp-session-id"]);
     const session = id ? sessions.get(id) : undefined;
     if (!id) throw new HttpInputError(400, "Mcp-Session-Id is required");
     if (!session) throw new HttpInputError(404, "MCP session not found");
+    if (session.credentialId !== credentialId) throw new HttpInputError(401, "MCP credential does not match the initialized session");
+    if (dispatcher) session.dispatcher = dispatcher;
     session.lastSeenAt = Date.now();
-    return id;
+    return { id, session };
+  }
+
+  async function authenticate(request: IncomingMessage): Promise<{ dispatcher: MemoryToolDispatcher; credentialId?: string } | undefined> {
+    const authorization = headerValue(request.headers.authorization);
+    const token = bearerValue(authorization);
+    if (!token) return undefined;
+    if (options.credentialResolver) {
+      const authContext = await options.credentialResolver(token);
+      if (!authContext) return undefined;
+      return {
+        dispatcher: options.dispatcher.withAuthContext(authContext, options.authMode ?? "team"),
+        credentialId: authContext.credential_id
+      };
+    }
+    if (!options.bearerToken || !tokenMatches(authorization, options.bearerToken)) return undefined;
+    if (options.authContext) {
+      return {
+        dispatcher: options.dispatcher.withAuthContext(options.authContext, options.authMode ?? "hybrid"),
+        credentialId: options.authContext.credential_id
+      };
+    }
+    return { dispatcher: options.dispatcher };
   }
 
   const server = createServer((request, response) => {
     let counted = false;
     void (async () => {
       const path = new URL(request.url ?? "/", "http://localhost").pathname;
-      validateBrowserOrigin(request);
+      validateBrowserOrigin(request, options.allowRemoteAccess);
       if (path === "/health" && request.method === "GET") {
         writeJson(response, 200, { status: "ok" });
         return;
@@ -203,18 +258,19 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
       if (activeRequests >= maxInFlight) throw new HttpInputError(503, "too many in-flight requests");
       activeRequests += 1;
       counted = true;
-      if (!tokenMatches(headerValue(request.headers.authorization), options.bearerToken)) {
+      const authenticated = await authenticate(request);
+      if (!authenticated) {
         writeJson(response, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
         return;
       }
       if (request.method === "GET") {
-        requireSession(request);
+        requireSession(request, authenticated.credentialId, authenticated.dispatcher);
         response.writeHead(405, { allow: "POST, DELETE", "cache-control": "no-store" });
         response.end();
         return;
       }
       if (request.method === "DELETE") {
-        const sessionId = requireSession(request);
+        const { id: sessionId } = requireSession(request, authenticated.credentialId, authenticated.dispatcher);
         sessions.delete(sessionId);
         response.writeHead(204, { "cache-control": "no-store" });
         response.end();
@@ -231,8 +287,8 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
         if (incoming.some((rpc) => rpc.method === "initialize")) {
           throw new HttpInputError(400, "initialize must be a single request");
         }
-        const sessionId = requireSession(request);
-        const replies = (await Promise.all(incoming.map((rpc) => rpcEnvelope(options.dispatcher, rpc))))
+        const { id: sessionId, session } = requireSession(request, authenticated.credentialId, authenticated.dispatcher);
+        const replies = (await Promise.all(incoming.map((rpc) => rpcEnvelope(session.dispatcher, rpc))))
           .filter((reply): reply is JsonObject => reply !== undefined);
         if (replies.length === 0) {
           response.writeHead(202, { "mcp-session-id": sessionId, "cache-control": "no-store" });
@@ -251,13 +307,14 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
         pruneSessions();
         if (sessions.size >= maxSessions) throw new HttpInputError(503, "session capacity reached");
         sessionId = uuid7();
-        sessions.set(sessionId, { lastSeenAt: Date.now() });
+        sessions.set(sessionId, { lastSeenAt: Date.now(), credentialId: authenticated.credentialId, dispatcher: authenticated.dispatcher });
       } else {
-        sessionId = requireSession(request);
+        sessionId = requireSession(request, authenticated.credentialId, authenticated.dispatcher).id;
       }
 
       try {
-        const result = await dispatchRpc(options.dispatcher, rpc);
+        const sessionDispatcher = sessions.get(sessionId)?.dispatcher ?? authenticated.dispatcher;
+        const result = await dispatchRpc(sessionDispatcher, rpc);
         if (rpc.id === undefined) {
           response.writeHead(202, { "mcp-session-id": sessionId, "cache-control": "no-store" });
           response.end();
@@ -307,18 +364,57 @@ function positivePort(value: string | undefined): number {
   return parsed;
 }
 
+export function createControlCredentialResolver(controlBaseUrl: string): CredentialResolver {
+  const base = controlBaseUrl.replace(/\/+$/, "");
+  let parsed: URL;
+  try { parsed = new URL(base); }
+  catch { throw new Error("NEUROMEM_CONTROL_API_URL must be an HTTP(S) URL"); }
+  if (!(["http:", "https:"] as string[]).includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error("NEUROMEM_CONTROL_API_URL must be an HTTP(S) URL without credentials");
+  }
+  return async (bearerToken: string) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5_000);
+    timeout.unref?.();
+    try {
+      const response = await fetch(`${base}/api/v1/me`, {
+        headers: { accept: "application/json", authorization: `Bearer ${bearerToken}` },
+        redirect: "error",
+        signal: controller.signal
+      });
+      if (!response.ok) { await response.body?.cancel(); return undefined; }
+      const payload = await readBoundedJsonResponse(response, 64 * 1_024) as { context?: Partial<AuthContext> };
+      const context = payload.context;
+      if (!context || typeof context.principal_id !== "string" || typeof context.credential_id !== "string"
+        || typeof context.workspace_id !== "string" || typeof context.project_id !== "string"
+        || typeof context.human_peer_id !== "string" || !Array.isArray(context.capabilities)) return undefined;
+      return context as AuthContext;
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+}
+
 export async function startHttpServerFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const token = env.NEUROMEM_MCP_TOKEN;
-  if (!token || Buffer.byteLength(token, "utf8") < 16) {
+  const controlUrl = env.NEUROMEM_CONTROL_API_URL;
+  if (!controlUrl && (!token || Buffer.byteLength(token, "utf8") < 16)) {
     throw new Error("NEUROMEM_MCP_TOKEN must be at least 16 bytes");
   }
   const router = new FederatedMemoryRouter(loadRouterConfig(env));
   await router.ready();
-  const dispatcher = new MemoryToolDispatcher(router);
+  const auth = loadMcpAuthConfig(env);
+  const dispatcher = new MemoryToolDispatcher(router, { authMode: auth.context ? auth.mode : "hybrid", authContext: auth.context });
   router.startRetryWorker();
   const server = createMcpHttpServer({
     dispatcher,
     bearerToken: token,
+    credentialResolver: controlUrl ? createControlCredentialResolver(controlUrl) : undefined,
+    authContext: auth.context,
+    authMode: auth.mode,
+    allowRemoteAccess: env.NEUROMEM_MCP_ALLOW_REMOTE === "true",
     maxBodyBytes: env.NEUROMEM_MCP_MAX_BODY_BYTES ? Number(env.NEUROMEM_MCP_MAX_BODY_BYTES) : undefined
   });
   const host = env.HOST || "127.0.0.1";

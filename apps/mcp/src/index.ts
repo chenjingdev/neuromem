@@ -1,12 +1,15 @@
-export { loadRouterConfig } from "./config.js";
+export { loadMcpAuthConfig, loadRouterConfig } from "./config.js";
 export { CoreClient, CoreRequestError } from "./core-client.js";
-export { createMcpHttpServer, startHttpServerFromEnv, stopHttpServer } from "./http.js";
+export { createControlCredentialResolver, createMcpHttpServer, startHttpServerFromEnv, stopHttpServer } from "./http.js";
 export { uuid7 } from "./ids.js";
 export { dispatchRpc, RpcError } from "./rpc.js";
 export { DurableRetryQueue } from "./retry-queue.js";
 export { FederatedMemoryRouter } from "./router.js";
-export { MEMORY_TOOLS, MemoryToolDispatcher } from "./tools.js";
+export { MEMORY_TOOLS, TEAM_MEMORY_TOOLS, MemoryToolDispatcher } from "./tools.js";
+export type { McpAuthMode, MemoryToolDispatcherOptions } from "./tools.js";
 export type {
+  AuthContext,
+  CredentialResolver,
   CoreNodeConfig,
   DeliveryState,
   DeliveryStatus,

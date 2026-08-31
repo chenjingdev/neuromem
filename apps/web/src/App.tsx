@@ -1,4 +1,4 @@
-import { BookOpen, BrainCircuit, FileSearch, GitFork, Home, Menu, Network, PanelLeftClose, PanelLeftOpen, Search, X } from "lucide-react";
+import { BookOpen, BrainCircuit, FileSearch, GitFork, Home, Menu, Network, PanelLeftOpen, Search, UsersRound, X } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { coreApi, exchangeManagerBootstrap } from "./api";
 import { Button, EmptyState, ErrorState, LoadingState } from "./components/common";
@@ -9,6 +9,7 @@ import { GraphPage } from "./pages/GraphPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { RecallPage } from "./pages/RecallPage";
 import { WikiPage } from "./pages/WikiPage";
+import { TeamPage } from "./pages/TeamPage";
 import type { ProjectOption, Scope, WorkspaceOption } from "./types";
 
 const productRoutes = [
@@ -17,6 +18,7 @@ const productRoutes = [
   { path: "/app/claims", label: "주장", icon: Network },
   { path: "/app/wiki", label: "Wiki", icon: BookOpen },
   { path: "/app/graph", label: "그래프", icon: GitFork },
+  { path: "/app/team", label: "팀 관리", icon: UsersRound },
 ];
 
 export default function App() {
@@ -105,6 +107,7 @@ function ProductRoute({ path, scope, navigate }: { path: string; scope: Scope; n
   if (path === "/app/claims") return <ClaimsPage scope={scope} />;
   if (path === "/app/wiki") return <WikiPage scope={scope} />;
   if (path === "/app/graph") return <GraphPage scope={scope} />;
+  if (path === "/app/team") return <TeamPage scope={scope} />;
   return <OverviewPage scope={scope} navigate={navigate} />;
 }
 

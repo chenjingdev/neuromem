@@ -5,6 +5,27 @@ export interface MemoryScope {
   project_id: string;
 }
 
+/**
+ * Server-verified identity and scope attached to one MCP credential.
+ *
+ * Tool arguments must never be used to replace any of these values.  HTTP
+ * sessions pin this context at initialize time so a bearer token cannot be
+ * swapped mid-session to cross a workspace, project, or peer boundary.
+ */
+export interface AuthContext {
+  principal_id: string;
+  credential_id: string;
+  workspace_id: string;
+  project_id: string;
+  human_peer_id: string;
+  agent_peer_id?: string;
+  capabilities: string[];
+  request_id?: string;
+  client?: "codex" | "claude" | "custom";
+}
+
+export type CredentialResolver = (bearerToken: string) => AuthContext | undefined | Promise<AuthContext | undefined>;
+
 export interface CoreNodeConfig {
   id: string;
   baseUrl: string;

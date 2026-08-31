@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { CoreNodeConfig, RouterConfig } from "./types.js";
+import type { AuthContext, CoreNodeConfig, RouterConfig } from "./types.js";
+import type { McpAuthMode } from "./tools.js";
 
 type Environment = Record<string, string | undefined>;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -24,6 +25,40 @@ interface RawRouterConfig {
   core_max_response_bytes?: unknown;
   rrf_k?: unknown;
   retry_interval_ms?: unknown;
+}
+
+export interface McpAuthConfig {
+  mode: McpAuthMode;
+  context?: AuthContext;
+}
+
+export function loadMcpAuthConfig(env: Environment = process.env): McpAuthConfig {
+  const mode = (env.NEUROMEM_MCP_AUTH_MODE || (env.NEUROMEM_MCP_AUTH_CONTEXT || env.NEUROMEM_CONTROL_API_URL ? "team" : "hybrid")).toLowerCase();
+  if (mode !== "legacy" && mode !== "team" && mode !== "hybrid") {
+    throw new Error("NEUROMEM_MCP_AUTH_MODE must be legacy, team, or hybrid");
+  }
+  if (!env.NEUROMEM_MCP_AUTH_CONTEXT) {
+    if (mode === "team" && !env.NEUROMEM_CONTROL_API_URL) throw new Error("team auth mode requires NEUROMEM_MCP_AUTH_CONTEXT or NEUROMEM_CONTROL_API_URL");
+    return { mode };
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(env.NEUROMEM_MCP_AUTH_CONTEXT);
+  } catch {
+    throw new Error("NEUROMEM_MCP_AUTH_CONTEXT is not valid JSON");
+  }
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("NEUROMEM_MCP_AUTH_CONTEXT must be an object");
+  const value = decoded as Record<string, unknown>;
+  for (const key of ["principal_id", "credential_id", "workspace_id", "project_id", "human_peer_id"] as const) {
+    if (typeof value[key] !== "string" || value[key] === "") throw new Error(`NEUROMEM_MCP_AUTH_CONTEXT.${key} is required`);
+  }
+  if (!Array.isArray(value.capabilities) || value.capabilities.some((item) => typeof item !== "string")) {
+    throw new Error("NEUROMEM_MCP_AUTH_CONTEXT.capabilities must be a string array");
+  }
+  if (value.client !== undefined && !["codex", "claude", "custom"].includes(String(value.client))) {
+    throw new Error("NEUROMEM_MCP_AUTH_CONTEXT.client is invalid");
+  }
+  return { mode, context: value as unknown as AuthContext };
 }
 
 function parsePositiveInteger(value: unknown, fallback: number, label: string): number {
