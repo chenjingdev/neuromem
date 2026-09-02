@@ -299,6 +299,94 @@ def test_named_project_uses_uuid_while_core_overlay_keeps_general_sentinel(
         _clear_core_override()
 
 
+def test_workspace_share_controls_cross_workspace_search(client, bootstrapped):
+    fake = FakeCore()
+    _override_core(fake)
+    try:
+        source_id = bootstrapped["workspace"]["id"]
+        source_project_id = bootstrapped["general_project"]["id"]
+        source_token = bootstrapped["recovery_credential"]["token"]
+        target = _create_second_workspace(client)
+        target_id = target["id"]
+        target_project_id = client.get(
+            f"/api/v1/workspaces/{target_id}/projects",
+            headers={"X-Neuromem-Workspace": target_id},
+        ).json()[0]["id"]
+
+        share = client.post(
+            "/api/v1/workspace-shares",
+            headers=auth_headers(source_token, source_id),
+            json={
+                "recipient_workspace_id": target_id,
+                "display_mode": "projects",
+                "project_ids": [source_project_id],
+            },
+        ).json()
+        approved = client.post(
+            f"/api/v1/workspace-shares/{share['id']}:approve",
+            headers={"X-Neuromem-Workspace": target_id},
+        )
+        assert approved.status_code == 200, approved.text
+
+        target_headers = {
+            "X-Neuromem-Workspace": target_id,
+            "X-Neuromem-Project": target_project_id,
+        }
+        recalled = client.post(
+            "/api/v1/recall",
+            headers=target_headers,
+            json={
+                "workspace_id": target_id,
+                "project_id": target_project_id,
+                "query": "shared decision",
+                "include": ["records"],
+                "include_federated": True,
+            },
+        )
+        assert recalled.status_code == 200, recalled.text
+        shared = [
+            item
+            for item in recalled.json()["records"]
+            if item.get("workspace_share_id") == share["id"]
+        ]
+        assert len(shared) == 1
+        assert shared[0]["source_workspace_id"] == source_id
+        assert shared[0]["source_project_id"] == source_project_id
+        assert any(
+            call["path"] == f"/v3/workspaces/{source_id}/search"
+            and call["context"].human_peer_id is None
+            and call["context"].agent_peer_id is None
+            for call in fake.calls
+        )
+
+        revoked = client.post(
+            f"/api/v1/workspace-shares/{share['id']}:revoke",
+            headers=auth_headers(source_token, source_id),
+        )
+        assert revoked.status_code == 200, revoked.text
+        fake.calls.clear()
+        isolated = client.post(
+            "/api/v1/recall",
+            headers=target_headers,
+            json={
+                "workspace_id": target_id,
+                "project_id": target_project_id,
+                "query": "shared decision",
+                "include": ["records"],
+                "include_federated": True,
+            },
+        )
+        assert isolated.status_code == 200, isolated.text
+        assert not any(
+            item.get("workspace_share_id") for item in isolated.json()["records"]
+        )
+        assert not any(
+            call["path"] == f"/v3/workspaces/{source_id}/search" for call in fake.calls
+        )
+    finally:
+        _clear_core_override()
+
+
 def test_approved_transfer_is_imported_by_gateway_with_provenance(client, bootstrapped):
     fake = FakeCore()
     _override_core(fake)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 from contextlib import asynccontextmanager
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import (
     APIRouter,
@@ -15,7 +17,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -43,7 +45,9 @@ from .models import (
     Peer,
     PrincipalPeerLink,
     Project,
+    ProjectFolderBinding,
     ProjectGrant,
+    SystemState,
     TransferRequest,
     WikiCitation,
     WikiPage,
@@ -51,7 +55,13 @@ from .models import (
     Workspace,
     WorkspaceLink,
     WorkspaceMembership,
+    WorkspaceShare,
     utcnow,
+)
+from .node_manager_client import (
+    NodeManagerClient,
+    NodeManagerError,
+    get_node_manager_client,
 )
 from .schemas import (
     AgentPeerCreate,
@@ -76,13 +86,16 @@ from .schemas import (
     InvitationCreate,
     InvitationCreated,
     InvitationView,
+    LocalTestLoginPrefill,
     LoginRequest,
     MembershipUpdate,
     MembershipView,
+    NodeView,
     PeerBindingView,
     PeerView,
     PrincipalView,
     ProjectCreate,
+    ProjectFolderBindingView,
     ProjectGrantUpsert,
     ProjectGrantView,
     ProjectView,
@@ -100,6 +113,11 @@ from .schemas import (
     WorkspaceCreate,
     WorkspaceLinkCreate,
     WorkspaceLinkView,
+    WorkspaceProjectionView,
+    WorkspaceProjectRef,
+    WorkspaceSelectionView,
+    WorkspaceShareCreate,
+    WorkspaceShareView,
     WorkspaceView,
 )
 from .security import (
@@ -117,6 +135,7 @@ from .services import (
     add_revision,
     approve_transfer,
     approve_workspace_link,
+    approve_workspace_share,
     audit_auth,
     bootstrap,
     complete_transfer,
@@ -127,14 +146,18 @@ from .services import (
     create_transfer,
     create_workspace_bundle,
     create_workspace_link,
+    create_workspace_share,
     issue_credential,
     login,
     reject_transfer,
+    reject_workspace_share,
     require_admin_membership,
     revoke_federated_grant,
+    revoke_workspace_share,
     transfer_agent_owner,
     update_membership,
     validate_projects,
+    workspace_share_projects,
 )
 
 
@@ -149,16 +172,17 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Neuromem Control Plane API",
     version=__version__,
-    summary="Sovereign workspace, identity, federation, and Wiki control plane",
+    summary="Node-local workspace, identity, sharing, and Wiki control plane",
     description=(
-        "The Apache-2.0 product boundary for native Workspace and Project "
-        "authorization in front of the AGPL memory core."
+        "The Apache-2.0 product boundary for a single physical Node with native "
+        "Workspace and Project authorization in front of the AGPL memory core."
     ),
     lifespan=lifespan,
 )
 api = APIRouter(prefix="/api/v1")
 Database = Annotated[Session, Depends(db_session)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
+NodeManager = Annotated[NodeManagerClient, Depends(get_node_manager_client)]
 
 
 @app.exception_handler(ControlError)
@@ -192,7 +216,7 @@ async def memory_core_error_handler(_: Request, error: MemoryCoreError) -> JSONR
 
 @app.get("/health", tags=["system"])
 def health() -> dict[str, str]:
-    return {"status": "ok", "version": __version__, "mode": "team"}
+    return {"status": "ok", "version": __version__, "scope": "node"}
 
 
 def _cookie(response: Response, token: str, settings: Settings) -> None:
@@ -246,6 +270,41 @@ def _project(db: Session, workspace_id: str, project_id: str) -> Project:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
+
+
+def _workspace_share_view(db: Session, share: WorkspaceShare) -> WorkspaceShareView:
+    owner = db.get(Workspace, share.owner_workspace_id)
+    recipient = db.get(Workspace, share.recipient_workspace_id)
+    if owner is None or recipient is None:
+        raise HTTPException(status_code=409, detail="workspace share is corrupt")
+    return WorkspaceShareView(
+        id=share.id,
+        owner_workspace_id=owner.id,
+        owner_workspace_name=owner.name,
+        recipient_workspace_id=recipient.id,
+        recipient_workspace_name=recipient.name,
+        display_mode=share.display_mode,
+        project_refs=[
+            WorkspaceProjectRef(id=project.id, name=project.name)
+            for project in workspace_share_projects(db, share)
+        ],
+        owner_approved_at=share.owner_approved_at,
+        recipient_approved_at=share.recipient_approved_at,
+        status=share.status,
+    )
+
+
+def _workspace_projection_view(
+    db: Session, share: WorkspaceShare
+) -> WorkspaceProjectionView:
+    view = _workspace_share_view(db, share)
+    return WorkspaceProjectionView(
+        share_id=view.id,
+        owner_workspace_id=view.owner_workspace_id,
+        owner_workspace_name=view.owner_workspace_name,
+        display_mode=view.display_mode,
+        project_refs=view.project_refs,
+    )
 
 
 def _revision_view(db: Session, revision: WikiRevision) -> WikiRevisionView:
@@ -336,6 +395,32 @@ def post_login(
     )
 
 
+@api.get(
+    "/auth/local-test-prefill",
+    response_model=LocalTestLoginPrefill,
+    include_in_schema=False,
+)
+def get_local_test_login_prefill(
+    request: Request,
+    response: Response,
+    settings: AppSettings,
+) -> LocalTestLoginPrefill:
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=404, detail="not found")
+    if (
+        not settings.local_test_login_prefill
+        or not settings.local_test_login_email
+        or not settings.local_test_login_password
+    ):
+        raise HTTPException(status_code=404, detail="not found")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return LocalTestLoginPrefill(
+        email=settings.local_test_login_email,
+        password=settings.local_test_login_password,
+    )
+
+
 @api.post("/auth/logout", status_code=204, tags=["auth"])
 def post_logout(response: Response, db: Database, auth: CurrentAuth) -> None:
     if auth.web_session:
@@ -355,6 +440,21 @@ def post_logout(response: Response, db: Database, auth: CurrentAuth) -> None:
 def get_me(auth: CurrentAuth) -> AuthEnvelope:
     return AuthEnvelope(
         principal=PrincipalView.model_validate(auth.principal), context=auth.context
+    )
+
+
+@api.get("/node", response_model=NodeView, tags=["node"])
+def get_node(db: Database, _auth: CurrentAuth) -> NodeView:
+    state = db.get(SystemState, "bootstrap")
+    if state is None or not state.value.get("node_id"):
+        raise HTTPException(status_code=409, detail="node is not initialized")
+    workspace_count = db.scalar(
+        select(func.count()).select_from(Workspace).where(Workspace.status == "active")
+    )
+    return NodeView(
+        id=str(state.value["node_id"]),
+        workspace_count=workspace_count or 0,
+        created_at=state.created_at,
     )
 
 
@@ -412,7 +512,6 @@ def post_workspace(
         principal=auth.principal,
         slug=body.slug,
         name=body.name,
-        kind=body.kind,
     )
     audit_auth(
         db,
@@ -424,6 +523,36 @@ def post_workspace(
     )
     db.commit()
     return WorkspaceView.model_validate(workspace)
+
+
+@api.post(
+    "/workspaces/{workspace_id}:select",
+    response_model=WorkspaceSelectionView,
+    tags=["workspaces"],
+)
+def post_select_workspace(
+    workspace_id: str, db: Database, auth: CurrentAuth
+) -> WorkspaceSelectionView:
+    _selected_workspace(auth, workspace_id)
+    require_capability(auth, "workspace.read")
+    workspace = db.get(Workspace, workspace_id)
+    if workspace is None or workspace.status != "active":
+        raise HTTPException(status_code=404, detail="workspace not found")
+    projects = list(
+        db.scalars(
+            select(Project)
+            .where(
+                Project.workspace_id == workspace_id,
+                Project.status == "active",
+            )
+            .order_by(Project.is_general.desc(), Project.name)
+        )
+    )
+    return WorkspaceSelectionView(
+        workspace=WorkspaceView.model_validate(workspace),
+        projects=[ProjectView.model_validate(project) for project in projects],
+        context=auth.context,
+    )
 
 
 @api.get(
@@ -606,6 +735,221 @@ def post_project(
     )
     db.commit()
     return ProjectView.model_validate(project)
+
+
+def _loopback_host(value: str | None) -> bool:
+    if not value:
+        return False
+    candidate = value.split(",", 1)[0].strip()
+    try:
+        parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
+        hostname = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_loopback_request(request: Request) -> bool:
+    # Docker NAT can make the original client address look like a private
+    # gateway. Trust the browser-visible Host and, when supplied, Origin;
+    # X-Forwarded-For is not a reliable local/remote signal at this boundary.
+    if not _loopback_host(request.headers.get("host")):
+        return False
+    origin = request.headers.get("origin")
+    if origin and not _loopback_host(origin):
+        return False
+    return True
+
+
+def _local_project_folder(
+    request: Request,
+    project_id: str,
+    db: Session,
+    auth: CurrentAuth,
+    *,
+    capability: str,
+) -> Project:
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=404, detail="not found")
+    workspace_id = auth.context.workspace_id
+    if workspace_id is None or auth.context.project_id != project_id:
+        raise HTTPException(
+            status_code=403,
+            detail="authenticated Workspace/Project scope does not match request",
+        )
+    require_capability(auth, capability)
+    project = _project(db, workspace_id, project_id)
+    if project.status != "active":
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
+
+
+def _folder_binding(
+    db: Session, *, principal_id: str, project_id: str
+) -> ProjectFolderBinding | None:
+    return db.scalar(
+        select(ProjectFolderBinding).where(
+            ProjectFolderBinding.principal_id == principal_id,
+            ProjectFolderBinding.project_id == project_id,
+        )
+    )
+
+
+def _folder_manager_http_error(error: NodeManagerError) -> HTTPException:
+    public_status = (
+        error.status_code
+        if error.status_code in {400, 409, 422, 501, 503}
+        else status.HTTP_502_BAD_GATEWAY
+    )
+    safe_details = {
+        status.HTTP_400_BAD_REQUEST: "로컬 Node Manager가 폴더 요청을 거부했습니다.",
+        status.HTTP_409_CONFLICT: "다른 폴더 선택창이 이미 열려 있습니다.",
+        status.HTTP_422_UNPROCESSABLE_CONTENT: (
+            "로컬 Node Manager가 폴더 요청을 거부했습니다."
+        ),
+        status.HTTP_501_NOT_IMPLEMENTED: (
+            "이 운영체제에서는 폴더 선택을 지원하지 않습니다."
+        ),
+        status.HTTP_503_SERVICE_UNAVAILABLE: (
+            "로컬 Node Manager의 폴더 선택창에 연결하지 못했습니다."
+        ),
+    }
+    detail = safe_details.get(
+        public_status, "로컬 Node Manager가 폴더 요청을 처리하지 못했습니다."
+    )
+    return HTTPException(status_code=public_status, detail=detail)
+
+
+@api.get(
+    "/projects/{project_id}/local-folder",
+    response_model=ProjectFolderBindingView | None,
+    tags=["projects"],
+)
+def get_project_local_folder(
+    request: Request,
+    project_id: str,
+    db: Database,
+    auth: CurrentAuth,
+) -> ProjectFolderBindingView | None:
+    _local_project_folder(request, project_id, db, auth, capability="project.read")
+    binding = _folder_binding(db, principal_id=auth.principal.id, project_id=project_id)
+    return ProjectFolderBindingView.model_validate(binding) if binding else None
+
+
+@api.post(
+    "/projects/{project_id}/local-folder:pick",
+    response_model=ProjectFolderBindingView | None,
+    tags=["projects"],
+)
+def post_pick_project_local_folder(
+    request: Request,
+    project_id: str,
+    db: Database,
+    auth: CurrentAuth,
+    settings: AppSettings,
+    manager: NodeManager,
+) -> ProjectFolderBindingView | None:
+    project = _local_project_folder(
+        request, project_id, db, auth, capability="project.write"
+    )
+    manager_failure: HTTPException | None = None
+    try:
+        picked = manager.pick_folder(
+            node_id=settings.node_id,
+            context=auth.context,
+        )
+    except NodeManagerError as error:
+        manager_failure = _folder_manager_http_error(error)
+    if manager_failure is not None:
+        raise manager_failure from None
+    if picked.cancelled:
+        return None
+    source = picked.source
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Node Manager did not return a folder source",
+        )
+    binding = _folder_binding(db, principal_id=auth.principal.id, project_id=project_id)
+    if binding is None:
+        binding = ProjectFolderBinding(
+            node_id=settings.node_id,
+            workspace_id=project.workspace_id,
+            project_id=project.id,
+            principal_id=auth.principal.id,
+            source_id=source.source_id,
+            display_name=source.display_name,
+            display_path=source.display_path,
+            status=source.status,
+        )
+        db.add(binding)
+    else:
+        binding.node_id = settings.node_id
+        binding.source_id = source.source_id
+        binding.display_name = source.display_name
+        binding.display_path = source.display_path
+        binding.status = source.status
+    db.flush()
+    audit_auth(
+        db,
+        auth,
+        "project_folder.connected",
+        "project_folder_binding",
+        binding.id,
+        workspace_id=project.workspace_id,
+        details={"project_id": project.id, "source_id": source.source_id},
+    )
+    db.commit()
+    db.refresh(binding)
+    return ProjectFolderBindingView.model_validate(binding)
+
+
+@api.delete(
+    "/projects/{project_id}/local-folder",
+    status_code=204,
+    tags=["projects"],
+)
+def delete_project_local_folder(
+    request: Request,
+    project_id: str,
+    db: Database,
+    auth: CurrentAuth,
+    settings: AppSettings,
+    manager: NodeManager,
+) -> None:
+    project = _local_project_folder(
+        request, project_id, db, auth, capability="project.write"
+    )
+    binding = _folder_binding(db, principal_id=auth.principal.id, project_id=project_id)
+    if binding is None:
+        return
+    manager_failure: HTTPException | None = None
+    try:
+        manager.detach_folder(
+            node_id=settings.node_id,
+            context=auth.context,
+            source_id=binding.source_id,
+        )
+    except NodeManagerError as error:
+        manager_failure = _folder_manager_http_error(error)
+    if manager_failure is not None:
+        raise manager_failure from None
+    audit_auth(
+        db,
+        auth,
+        "project_folder.disconnected",
+        "project_folder_binding",
+        binding.id,
+        workspace_id=project.workspace_id,
+        details={"project_id": project.id, "source_id": binding.source_id},
+    )
+    db.delete(binding)
+    db.commit()
 
 
 @api.put(
@@ -954,6 +1298,110 @@ def delete_project_grant(
         details={"project_id": project_id},
     )
     db.commit()
+
+
+@api.get(
+    "/workspace-shares",
+    response_model=list[WorkspaceShareView],
+    tags=["workspace-sharing"],
+)
+def get_workspace_shares(db: Database, auth: CurrentAuth) -> list[WorkspaceShareView]:
+    workspace_id = auth.context.workspace_id
+    if workspace_id is None:
+        raise HTTPException(status_code=400, detail="workspace context required")
+    require_capability(auth, "workspace.read")
+    rows = db.scalars(
+        select(WorkspaceShare)
+        .where(
+            (WorkspaceShare.owner_workspace_id == workspace_id)
+            | (WorkspaceShare.recipient_workspace_id == workspace_id)
+        )
+        .order_by(WorkspaceShare.created_at.desc())
+    )
+    return [_workspace_share_view(db, row) for row in rows]
+
+
+@api.post(
+    "/workspace-shares",
+    response_model=WorkspaceShareView,
+    tags=["workspace-sharing"],
+)
+def post_workspace_share(
+    body: WorkspaceShareCreate, db: Database, auth: CurrentAuth
+) -> WorkspaceShareView:
+    share = create_workspace_share(
+        db,
+        auth,
+        recipient_workspace_id=body.recipient_workspace_id,
+        display_mode=body.display_mode,
+        project_ids=body.project_ids,
+    )
+    return _workspace_share_view(db, share)
+
+
+@api.post(
+    "/workspace-shares/{share_id}:approve",
+    response_model=WorkspaceShareView,
+    tags=["workspace-sharing"],
+)
+def post_approve_workspace_share(
+    share_id: str, db: Database, auth: CurrentAuth
+) -> WorkspaceShareView:
+    share = db.get(WorkspaceShare, share_id)
+    if share is None:
+        raise HTTPException(status_code=404, detail="workspace share not found")
+    return _workspace_share_view(db, approve_workspace_share(db, auth, share))
+
+
+@api.post(
+    "/workspace-shares/{share_id}:reject",
+    response_model=WorkspaceShareView,
+    tags=["workspace-sharing"],
+)
+def post_reject_workspace_share(
+    share_id: str, db: Database, auth: CurrentAuth
+) -> WorkspaceShareView:
+    share = db.get(WorkspaceShare, share_id)
+    if share is None:
+        raise HTTPException(status_code=404, detail="workspace share not found")
+    return _workspace_share_view(db, reject_workspace_share(db, auth, share))
+
+
+@api.post(
+    "/workspace-shares/{share_id}:revoke",
+    response_model=WorkspaceShareView,
+    tags=["workspace-sharing"],
+)
+def post_revoke_workspace_share(
+    share_id: str, db: Database, auth: CurrentAuth
+) -> WorkspaceShareView:
+    share = db.get(WorkspaceShare, share_id)
+    if share is None:
+        raise HTTPException(status_code=404, detail="workspace share not found")
+    return _workspace_share_view(db, revoke_workspace_share(db, auth, share))
+
+
+@api.get(
+    "/workspace-projections",
+    response_model=list[WorkspaceProjectionView],
+    tags=["workspace-sharing"],
+)
+def get_workspace_projections(
+    db: Database, auth: CurrentAuth
+) -> list[WorkspaceProjectionView]:
+    workspace_id = auth.context.workspace_id
+    if workspace_id is None:
+        raise HTTPException(status_code=400, detail="workspace context required")
+    require_capability(auth, "workspace.read")
+    rows = db.scalars(
+        select(WorkspaceShare)
+        .where(
+            WorkspaceShare.recipient_workspace_id == workspace_id,
+            WorkspaceShare.status == "active",
+        )
+        .order_by(WorkspaceShare.created_at.desc())
+    )
+    return [_workspace_projection_view(db, row) for row in rows]
 
 
 @api.get(

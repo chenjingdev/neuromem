@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   exchangeManagerBootstrap,
+  coreApi,
   managerApi,
-  teamApi,
+  workspaceApi,
   normalizeBackup,
   normalizeBacklog,
   normalizeGraph,
@@ -19,12 +20,12 @@ afterEach(() => vi.restoreAllMocks());
 
 const rawNode = {
   node_id: "node-1",
-  alias: "Personal",
+  alias: "MacBook Node",
   ports: { api: 18001, dashboard: 14173, mcp: 18765 },
   generation: 2,
   desired_state: "running" as const,
   phase: "ready" as const,
-  compose_project: "neuromem-personal",
+  compose_project: "neuromem-node",
   schema_revision: "0001",
   created_at: "2026-08-31T00:00:00Z",
   updated_at: "2026-08-31T01:00:00Z",
@@ -34,7 +35,7 @@ const rawBackup = {
   backup_id: "backup-1",
   label: "before-update",
   node_id: "node-1",
-  node_alias: "Personal",
+  node_alias: "MacBook Node",
   generation: 2,
   schema_revision: "0001",
   created_at: "2026-08-31T01:00:00Z",
@@ -44,7 +45,7 @@ const rawBackup = {
 
 describe("API response normalization", () => {
   it("maps manager node, health, and backup fields to UI types", () => {
-    expect(normalizeNode(rawNode)).toMatchObject({ id: "node-1", name: "Personal", state: "healthy", version: "0001" });
+    expect(normalizeNode(rawNode)).toMatchObject({ id: "node-1", name: "MacBook Node", state: "healthy", version: "0001" });
     expect(normalizeNodeHealth({ node: rawNode, docker_available: true, phase: "ready", components: [{ name: "database", state: "running", health: "healthy" }], endpoints: { api: "http://127.0.0.1:18001" }, models: { embedding: { configured: true, model: "qwen3-embedding:4b", provider_status: "ready", provider_detail: null, last_probe_at: "2026-08-31T00:30:00Z" }, extraction: { configured: false, provider_status: "unconfigured", provider_detail: "generation provider not configured", last_probe_at: null } } })).toMatchObject({ state: "healthy", components: [{ name: "database" }], models: { embedding: { model: "qwen3-embedding:4b", provider_status: "ready" }, extraction: { configured: false } } });
     expect(normalizeBackup(rawBackup)).toMatchObject({ id: "backup-1", label: "before-update", size_bytes: 2048, state: "verified" });
     expect(normalizeBacklog({ node_id: "node-1", available: true, counts: { pending: 2, running: 1, retry: 3, failed: 4 } })).toMatchObject({ pending: 2, running: 1, retrying: 3, failed: 4 });
@@ -131,8 +132,52 @@ describe("API response normalization", () => {
   });
 });
 
-describe("team product API", () => {
-  it("loads team, peer, credential, grant, federation, and transfer data through the product session", async () => {
+describe("workspace product API", () => {
+  it("creates additional Workspaces and Projects without a product mode field", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify(
+      String(input).endsWith("/projects") ? { id: "project-2", name: "Research" } : { id: "workspace-2", name: "Lab" },
+    ), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await coreApi.createWorkspace("Lab");
+    await coreApi.createProject("workspace-2", "Research");
+
+    const workspaceBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(workspaceBody).toMatchObject({ name: "Lab", slug: "lab" });
+    expect(workspaceBody).not.toHaveProperty("kind");
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST", credentials: "include" });
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>)["x-neuromem-workspace"]).toBe("workspace-2");
+  });
+
+  it("gets, picks, and disconnects an opaque local folder binding with Project scope headers", async () => {
+    const binding = { id: "folder-1", project_id: "project-1", display_name: "neuromem", display_path: "~/dev/neuromem", status: "active", updated_at: "2026-09-01T01:00:00Z" };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => new Response(JSON.stringify(
+      init?.method === "DELETE" ? { ok: true } : binding,
+    ), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const scope = { workspaceId: "workspace-1", projectId: "project-1" };
+
+    await expect(workspaceApi.getProjectFolder(scope)).resolves.toEqual(binding);
+    await expect(workspaceApi.pickProjectFolder(scope)).resolves.toEqual(binding);
+    await workspaceApi.disconnectProjectFolder(scope);
+
+    expect(fetchMock.mock.calls.map(call => String(call[0]))).toEqual([
+      expect.stringMatching(/\/api\/v1\/projects\/project-1\/local-folder$/),
+      expect.stringMatching(/\/api\/v1\/projects\/project-1\/local-folder:pick$/),
+      expect.stringMatching(/\/api\/v1\/projects\/project-1\/local-folder$/),
+    ]);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "POST", body: "{}", credentials: "include" });
+    expect(fetchMock.mock.calls[2]?.[1]).toMatchObject({ method: "DELETE", credentials: "include" });
+    for (const call of fetchMock.mock.calls) {
+      const headers = call[1]?.headers as Record<string, string>;
+      expect(headers["x-neuromem-workspace"]).toBe(scope.workspaceId);
+      expect(headers["x-neuromem-project"]).toBe(scope.projectId);
+      expect(JSON.stringify(call[1]?.body || "")).not.toContain("/Users/");
+    }
+  });
+
+  it("loads members, peers, credentials, grants, shares, and transfers through the product session", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input);
       let body: unknown = { items: [] };
@@ -140,18 +185,20 @@ describe("team product API", () => {
       else if (url.endsWith("/workspaces/workspace-1/peer-bindings")) body = [{ principal_id: "principal-1", peer: { id: "human-1", workspace_id: "workspace-1", name: "Aram", kind: "human", status: "active" }, kind: "primary_human", status: "active" }, { principal_id: null, peer: { id: "agent-1", workspace_id: "workspace-1", name: "Aram Codex", kind: "agent", status: "active" }, kind: "agent_owner", client: "codex", owner_principal_id: "principal-1", status: "active" }];
       else if (url.endsWith("/credentials")) body = [{ id: "credential-1", name: "Codex", token_prefix: "nmem_1234", kind: "mcp", workspace_id: "workspace-1", project_ids: ["project-1"], principal_id: "principal-1", agent_peer_id: "agent-1", capabilities: ["memory:read"] }];
       else if (url.endsWith("/projects/project-1/grants")) body = { items: [{ id: "grant-1", project_id: "project-1", principal_id: "principal-1", capabilities: ["memory:read"] }] };
-      else if (url.endsWith("/workspace-links")) body = [{ id: "link-1", source_workspace_id: "workspace-1", target_workspace_id: "workspace-2", status: "active" }];
-      else if (url.endsWith("/federated-project-grants")) body = [{ id: "fgrant-1", workspace_link_id: "link-1", source_project_id: "external-project", target_workspace_id: "workspace-1", capabilities: ["search"], status: "active" }];
+      else if (url.endsWith("/workspace-shares")) body = [{ id: "share-1", owner_workspace_id: "workspace-2", owner_workspace_name: "External", recipient_workspace_id: "workspace-1", recipient_workspace_name: "Local", display_mode: "projects", project_refs: [{ id: "external-project", name: "Shared project" }], owner_approved_at: "2026-08-31T00:00:00Z", recipient_approved_at: "2026-08-31T00:01:00Z", status: "active" }];
+      else if (url.endsWith("/workspace-projections")) body = [{ share_id: "share-1", owner_workspace_id: "workspace-2", owner_workspace_name: "External", display_mode: "projects", project_refs: [{ id: "external-project", name: "Shared project" }] }];
       else if (url.includes("/transfer-requests?")) body = [{ id: "transfer-1", source_workspace_id: "workspace-2", source_project_id: "external-project", target_workspace_id: "workspace-1", target_project_id: "project-1", source_record_id: "record-1", provenance: { reason: "approved context" }, status: "pending_target" }];
       else throw new Error(`Unexpected URL ${url}`);
       return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const dashboard = await teamApi.dashboard({ workspaceId: "workspace-1", projectId: "project-1" });
+    const dashboard = await workspaceApi.dashboard({ workspaceId: "workspace-1", projectId: "project-1" });
     expect(dashboard.members[0]).toMatchObject({ display_name: "Aram", agent_peers: [{ client: "codex" }] });
     expect(dashboard.peer_bindings[0].agent_peers[0]).toMatchObject({ client: "codex" });
     expect(dashboard.credentials[0]).toMatchObject({ human_peer_id: "human-1", agent_peer_id: "agent-1" });
+    expect(dashboard.shares[0]).toMatchObject({ display_mode: "projects", project_refs: [{ id: "external-project" }] });
+    expect(dashboard.projections[0]).toMatchObject({ display_mode: "projects", project_refs: [{ id: "external-project" }] });
     expect(dashboard.transfer_requests[0]).toMatchObject({ status: "pending_target" });
     expect(fetchMock).toHaveBeenCalledTimes(7);
     expect(fetchMock.mock.calls.every(call => call[1]?.credentials === "include" && (call[1]?.headers as Record<string, string>)["x-neuromem-workspace"] === "workspace-1")).toBe(true);
@@ -169,12 +216,29 @@ describe("team product API", () => {
     ), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(teamApi.createCredential({ workspace_id: "workspace-1", project_id: "project-1", name: "Aram Codex", client: "codex", agent_peer_id: "agent-1", capabilities: ["memory:read"] })).resolves.toMatchObject({ secret: "one-time-secret" });
-    await teamApi.resolveTransferRequest({ workspaceId: "workspace-1", projectId: "project-1" }, "transfer-1", "approve");
+    await expect(workspaceApi.createCredential({ workspace_id: "workspace-1", project_id: "project-1", name: "Aram Codex", client: "codex", agent_peer_id: "agent-1", capabilities: ["memory:read"] })).resolves.toMatchObject({ secret: "one-time-secret" });
+    await workspaceApi.resolveTransferRequest({ workspaceId: "workspace-1", projectId: "project-1" }, "transfer-1", "approve");
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toMatch(/\/api\/v1\/credentials$/);
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain("one-time-secret");
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: "POST", credentials: "include" });
     expect(String(fetchMock.mock.calls[1]?.[0])).toMatch(/\/api\/v1\/transfer-requests\/transfer-1:approve$/);
+  });
+
+  it("proposes, approves, and revokes an owner-agreed Workspace share", async () => {
+    const share = { id: "share-1", owner_workspace_id: "workspace-1", recipient_workspace_id: "workspace-2", display_mode: "projects", project_refs: [{ id: "project-1", name: "Neuromem" }], owner_approved_at: "2026-08-31T00:00:00Z", recipient_approved_at: null, status: "proposed" };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify(share), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await workspaceApi.proposeShare("workspace-1", { recipient_workspace_id: "workspace-2", display_mode: "projects", project_ids: ["project-1"] });
+    await workspaceApi.approveShare("workspace-2", "share-1");
+    await workspaceApi.rejectShare("workspace-2", "share-1");
+    await workspaceApi.revokeShare("workspace-1", "share-1");
+
+    expect(fetchMock.mock.calls[0]).toEqual(expect.arrayContaining([expect.stringMatching(/\/api\/v1\/workspace-shares$/), expect.objectContaining({ method: "POST", body: JSON.stringify({ recipient_workspace_id: "workspace-2", display_mode: "projects", project_ids: ["project-1"] }) })]));
+    expect(fetchMock.mock.calls[1]).toEqual(expect.arrayContaining([expect.stringMatching(/\/api\/v1\/workspace-shares\/share-1:approve$/), expect.objectContaining({ method: "POST" })]));
+    expect(fetchMock.mock.calls[2]).toEqual(expect.arrayContaining([expect.stringMatching(/\/api\/v1\/workspace-shares\/share-1:reject$/), expect.objectContaining({ method: "POST" })]));
+    expect(fetchMock.mock.calls[3]).toEqual(expect.arrayContaining([expect.stringMatching(/\/api\/v1\/workspace-shares\/share-1:revoke$/), expect.objectContaining({ method: "POST" })]));
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Record<string, string>)["x-neuromem-workspace"]).toBe("workspace-2");
   });
 });

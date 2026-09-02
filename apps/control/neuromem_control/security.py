@@ -178,7 +178,7 @@ def _context_for(
         and credential is not None
         and len(credential.project_ids) == 1
     ):
-        # Team MCP credentials are normally bound to one Project. Selecting it
+        # MCP credentials are normally bound to one Project. Selecting it
         # server-side keeps workspace/project identity out of untrusted tool
         # arguments while multi-Project credentials must still choose explicitly.
         selected_project = credential.project_ids[0]

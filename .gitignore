@@ -19,8 +19,9 @@ coverage/
 .neuromem/
 backups/
 operations/
-deploy/team/team.env
+deploy/node/node.env
 .playwright-cli/
+.playwright-mcp/
 output/
 apps/manager/assets/admin-dist/
 apps/manager/assets/images/

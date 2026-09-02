@@ -5,30 +5,26 @@ import { Button, Card, EmptyState, ErrorState, LoadingState, PageHeading, Status
 import { useRemote, type RemoteState } from "../hooks";
 import type { ApiGenerationConnectionInput, ApiGenerationSource, Backup, CodexAuthStatus, CodexGenerationSource, GenerationModelSelection, GenerationProbeInput, GenerationSource, ModelProviderStatus, ModelSelectionProvider, ModelSelectionUpdate, NodeHealth, NodeModelSelection, NodeSummary, OperationPlan, OperationResult, ServiceState } from "../types";
 
-export function AdminPage({ productUrl }: { productUrl: string }) {
+export function AdminPage({ onProductUrlResolved }: { onProductUrlResolved?: (nodeEndpoint: string) => void } = {}) {
   const nodes = useRemote(() => managerApi.nodes(), []);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const activeId = selectedId || nodes.data?.[0]?.id || null;
+  const node = nodes.data?.[0];
 
-  if (nodes.loading) return <AdminFrame productUrl={productUrl}><LoadingState label="이 기기의 Neuromem Node를 확인하고 있습니다." /></AdminFrame>;
-  if (nodes.error instanceof ApiError && nodes.error.status === 401) return <AdminFrame productUrl={productUrl}><AdminAuthRequired /></AdminFrame>;
-  if (nodes.error) return <AdminFrame productUrl={productUrl}><ErrorState title="Node Manager에 연결할 수 없습니다." error={nodes.error} onRetry={nodes.retry} /></AdminFrame>;
+  useEffect(() => {
+    if (node?.endpoint) onProductUrlResolved?.(node.endpoint);
+  }, [node?.endpoint, onProductUrlResolved]);
 
-  return <AdminFrame productUrl={productUrl}>
+  if (nodes.loading) return <LoadingState label="이 기기의 Neuromem Node를 확인하고 있습니다." />;
+  if (nodes.error instanceof ApiError && nodes.error.status === 401) return <AdminAuthRequired />;
+  if (nodes.error) return <ErrorState title="Node Manager에 연결할 수 없습니다." error={nodes.error} onRetry={nodes.retry} />;
+
+  return <>
     <PageHeading eyebrow="LOCAL NODE OPERATOR" title="Node 관리" description="이 기기에서 실행되는 Neuromem 전체 상태와 안전한 복구 작업만 관리합니다." />
-    {!nodes.data?.length ? <EmptyState icon={<Server />} title="등록된 Node가 없습니다.">터미널에서 Node를 한 번 등록한 뒤 이 화면을 다시 열어주세요.</EmptyState> : <div className="admin-layout">
-      <aside className="node-list" aria-label="Node 목록"><span className="eyebrow">NODES</span>{nodes.data.map(node => <button key={node.id} className={activeId === node.id ? "selected" : ""} onClick={() => setSelectedId(node.id)}><Server /><span><strong>{node.name || node.id}</strong><small>{node.endpoint || node.version || node.id}</small></span><StatusPill state={node.state || "unknown"} /></button>)}</aside>
-      {activeId && <NodeDetail key={activeId} nodeId={activeId} summary={nodes.data.find(node => node.id === activeId) || nodes.data[0]} />}
-    </div>}
-  </AdminFrame>;
-}
-
-function AdminFrame({ productUrl, children }: { productUrl: string; children: React.ReactNode }) {
-  return <div className="admin-page"><header className="admin-topbar"><a className="wordmark" href={productUrl}><span className="brand-mark">N</span><span>Neuromem</span></a><div><span className="local-badge"><ShieldCheck size={14} />이 기기 전용</span><a href={productUrl}>기억 화면으로</a></div></header><main className="admin-content">{children}</main></div>;
+    {!node ? <EmptyState icon={<Server />} title="실행 중인 Node를 찾지 못했습니다.">터미널에서 Node 설정과 실행 상태를 확인한 뒤 이 화면을 다시 열어주세요.</EmptyState> : <NodeDetail nodeId={node.id} summary={node} />}
+  </>;
 }
 
 export function AdminAuthRequired() {
-  return <div className="state-panel auth-required" role="alert"><ShieldCheck /><strong>관리자 링크가 필요합니다.</strong><p>관리자 세션은 주소에 비밀값을 저장하지 않습니다. 이 기기의 터미널에서 아래 명령을 실행해 새 링크를 여세요.</p><code>neuromem admin open</code></div>;
+  return <div className="state-panel auth-required" role="alert"><ShieldCheck /><strong>관리자 링크가 필요합니다.</strong><p>관리자 세션은 주소에 비밀값을 저장하지 않습니다. 이 Node의 터미널에서 아래 명령을 실행해 새 링크를 여세요.</p><code>neuromem node admin open</code></div>;
 }
 
 function NodeDetail({ nodeId, summary }: { nodeId: string; summary: NodeSummary }) {
@@ -303,8 +299,8 @@ function ModelStatusCard({ nodeId, nodeState, models, selection, onRefresh }: { 
   };
 
   return <Card className="model-status-card">
-    <div className="card-heading"><div><span className="eyebrow">AI CONNECTION</span><h3>로컬 AI 상태</h3></div><StatusPill state={overall} label={overallLabel} /></div>
-    <p>기억 검색용 임베딩과 주장 생성용 모델의 연결 방식, 설정, Core 확인 기록입니다.</p>
+    <div className="card-heading"><div><span className="eyebrow">NODE COMPUTE</span><h3>컴퓨팅 소스</h3></div><StatusPill state={overall} label={overallLabel} /></div>
+    <p>이 Node에서 모든 Workspace가 사용하는 임베딩·생성 모델의 연결 방식, 설정, 실제 확인 기록입니다.</p>
     {selection.loading && !configuration && <div className="inline-message" role="status">모델 연결 정보를 확인하고 있습니다.</div>}
     {Boolean(selection.error) && <div className="inline-message error model-selection-error" role="alert"><TriangleAlert /> <span>{errorMessage(selection.error)}</span><Button type="button" className="quiet" onClick={selection.retry}>다시 확인</Button></div>}
     {mismatchedNode && <div className="inline-message error model-selection-error" role="alert"><TriangleAlert /> <span>현재 Node의 모델 목록을 확인하지 못했습니다. 다시 확인해 주세요.</span><Button type="button" className="quiet" onClick={selection.retry}>다시 확인</Button></div>}

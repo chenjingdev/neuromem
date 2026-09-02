@@ -1,9 +1,11 @@
 # Neuromem Control Plane
 
-Apache-2.0 service for sovereign Workspaces, nested Projects, Human/Agent Peer
-bindings, credentials, federation, two-sided transfers, and cited Project Wikis.
-It is an independent team/control boundary and never writes to a live Memory Core
-database.
+Apache-2.0 control service for one physical Neuromem Node. A Node is one
+monolithic installation on a Mac, DGX Spark, or another server. Each Node owns
+many isolated Workspaces, and each Workspace owns many Projects. The Control
+service manages identities, sharing, Human/Agent Peer bindings, credentials,
+two-sided transfers, and cited Project Wikis without writing directly to the
+Memory Core database.
 
 ## Run locally
 
@@ -30,6 +32,26 @@ X-Neuromem-Workspace: <workspace UUIDv7>
 X-Neuromem-Project: <project UUIDv7>  # required for project memory/Wiki access
 ```
 
+`GET /api/v1/workspaces` lists every local Workspace the Principal belongs to.
+`POST /api/v1/workspaces/{workspace_id}:select` validates a Workspace switch and
+returns its active Projects plus the resulting authorization context. Selection
+remains request-scoped; the server does not hide global mutable "current
+Workspace" state in a session.
+
+## Workspace sharing
+
+Workspaces are isolated by default. An Owner can propose a directional,
+read-only memory projection with `POST /api/v1/workspace-shares`; an Owner of the
+recipient Workspace must explicitly approve it. Admins cannot approve on behalf
+of Owners. Either side's Owner can revoke the share immediately.
+
+`display_mode=workspace` projects the owner's current active Projects grouped
+under its Workspace. `display_mode=projects` requires an explicit `project_ids`
+list and lets the recipient UI show only those Projects. Approved incoming
+projections are available from `GET /api/v1/workspace-projections`. Shared
+memory is searched only when callers opt in with `include_federated=true`, and
+revocation removes both the projection and search access.
+
 The Control Plane mints 60-second HMAC-signed internal context tokens at
 `POST /api/v1/internal-context-tokens`. A Memory Core adapter verifies that token
 instead of trusting client-supplied Workspace, Project, or Peer identifiers.
@@ -40,10 +62,10 @@ receive the Core address or signing key.
 
 ## Memory Gateway
 
-The team-native gateway is available under `/api/v1/memory`; compatibility aliases
+The Node gateway is available under `/api/v1/memory`; compatibility aliases
 used by Neuromem MCP are also exposed:
 
-| Team route | Core v3.1 route |
+| Gateway route | Core v3.1 route |
 | --- | --- |
 | `POST /memory/projects/{id}:ensure` | `POST /v3/workspaces/{w}/projects` |
 | `POST /memory/sessions` | `POST /v3/workspaces/{w}/sessions?project_id=...` |
@@ -74,6 +96,9 @@ require the Neuromem v3.1 Core patch to honor `project_id` and `include_general`
 - Agent credentials are server-bound to an Agent Peer and cannot choose an author.
 - The last active Workspace Owner cannot be removed or demoted.
 - Restricted Projects require an explicit grant for non-admin members.
+- Workspaces share no memory until both Workspace Owners approve a share.
+- A shared Workspace can be grouped as a Workspace or flattened to Projects.
+- Either Workspace Owner can revoke projected memory access immediately.
 - Workspace links grant no access by themselves; Project grants require both sides.
 - A transfer requires source approval, target approval, and a separate import result.
 - Wiki revisions require local Message/Conclusion citations. Federated memory must be

@@ -13,7 +13,6 @@ from pydantic import (
 )
 
 Role = Literal["owner", "admin", "contributor", "viewer"]
-WorkspaceKind = Literal["personal", "company"]
 AgentClient = Literal["codex", "claude", "custom"]
 
 
@@ -32,14 +31,12 @@ class PrincipalView(APIModel):
 class WorkspaceCreate(BaseModel):
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,126}[a-z0-9]$")
     name: str = Field(min_length=1, max_length=256)
-    kind: WorkspaceKind = "company"
 
 
 class WorkspaceView(APIModel):
     id: str
     slug: str
     name: str
-    kind: str
     status: str
     created_at: dt.datetime
 
@@ -59,6 +56,15 @@ class ProjectView(APIModel):
     is_general: bool
     wiki_id: str
     status: str
+
+
+class ProjectFolderBindingView(APIModel):
+    id: str
+    project_id: str
+    display_name: str
+    display_path: str
+    status: Literal["active", "unavailable"]
+    updated_at: dt.datetime
 
 
 class MembershipView(APIModel):
@@ -214,6 +220,19 @@ class AuthEnvelope(BaseModel):
     context: AuthContext
 
 
+class NodeView(BaseModel):
+    id: str
+    status: Literal["ready"] = "ready"
+    workspace_count: int = Field(ge=0)
+    created_at: dt.datetime
+
+
+class WorkspaceSelectionView(BaseModel):
+    workspace: WorkspaceView
+    projects: list[ProjectView]
+    context: AuthContext
+
+
 class BootstrapRequest(BaseModel):
     email: EmailStr
     display_name: str = Field(min_length=1, max_length=256)
@@ -236,6 +255,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class LocalTestLoginPrefill(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=12, max_length=1024)
+
+
 class WorkspaceLinkCreate(BaseModel):
     source_workspace_id: str
     target_workspace_id: str
@@ -252,6 +276,47 @@ class WorkspaceLinkView(APIModel):
     target_approved_at: dt.datetime | None
     status: str
     revoked_at: dt.datetime | None
+
+
+class WorkspaceShareCreate(BaseModel):
+    recipient_workspace_id: str
+    display_mode: Literal["workspace", "projects"]
+    project_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_project_scope(self) -> WorkspaceShareCreate:
+        self.project_ids = list(dict.fromkeys(self.project_ids))
+        if self.display_mode == "workspace" and self.project_ids:
+            raise ValueError("workspace display uses all current active projects")
+        if self.display_mode == "projects" and not self.project_ids:
+            raise ValueError("projects display requires at least one project")
+        return self
+
+
+class WorkspaceProjectRef(BaseModel):
+    id: str
+    name: str
+
+
+class WorkspaceShareView(BaseModel):
+    id: str
+    owner_workspace_id: str
+    owner_workspace_name: str
+    recipient_workspace_id: str
+    recipient_workspace_name: str
+    display_mode: Literal["workspace", "projects"]
+    project_refs: list[WorkspaceProjectRef]
+    owner_approved_at: dt.datetime
+    recipient_approved_at: dt.datetime | None
+    status: Literal["proposed", "active", "rejected", "revoked"]
+
+
+class WorkspaceProjectionView(BaseModel):
+    share_id: str
+    owner_workspace_id: str
+    owner_workspace_name: str
+    display_mode: Literal["workspace", "projects"]
+    project_refs: list[WorkspaceProjectRef]
 
 
 class FederatedGrantCreate(BaseModel):

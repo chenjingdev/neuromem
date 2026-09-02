@@ -75,11 +75,9 @@ class Workspace(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     slug: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
-    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="company")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
 
     __table_args__ = (
-        CheckConstraint("kind IN ('personal','company')", name="ck_workspace_kind"),
         CheckConstraint("status IN ('active','disabled')", name="ck_workspace_status"),
     )
 
@@ -186,6 +184,35 @@ class ProjectGrant(Timestamped, Base):
     __table_args__ = (
         UniqueConstraint("project_id", "principal_id", name="uq_project_grant"),
         CheckConstraint("status IN ('active','revoked')", name="ck_grant_status"),
+    )
+
+
+class ProjectFolderBinding(Timestamped, Base):
+    __tablename__ = "project_folder_bindings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    node_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    principal_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("principals.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    display_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "principal_id", "project_id", name="uq_project_folder_principal_project"
+        ),
+        CheckConstraint(
+            "status IN ('active','unavailable')", name="ck_project_folder_status"
+        ),
     )
 
 
@@ -386,6 +413,59 @@ class WorkspaceLink(Timestamped, Base):
         CheckConstraint(
             "status IN ('pending','active','rejected','revoked')",
             name="ck_workspace_link_status",
+        ),
+    )
+
+
+class WorkspaceShare(Timestamped, Base):
+    """Owner-approved memory projection from one Workspace into another."""
+
+    __tablename__ = "workspace_shares"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_workspace_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    recipient_workspace_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    display_mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    project_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    proposed_by_principal_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("principals.id", ondelete="RESTRICT"), nullable=False
+    )
+    owner_approved_by_principal_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("principals.id", ondelete="RESTRICT"), nullable=False
+    )
+    recipient_approved_by_principal_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("principals.id", ondelete="RESTRICT")
+    )
+    owner_approved_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+    recipient_approved_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    rejected_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint(
+            "owner_workspace_id <> recipient_workspace_id",
+            name="ck_workspace_share_distinct",
+        ),
+        CheckConstraint(
+            "display_mode IN ('workspace','projects')",
+            name="ck_workspace_share_display_mode",
+        ),
+        CheckConstraint(
+            "status IN ('proposed','active','rejected','revoked')",
+            name="ck_workspace_share_status",
+        ),
+        Index(
+            "uq_workspace_share_live_pair",
+            "owner_workspace_id",
+            "recipient_workspace_id",
+            unique=True,
+            sqlite_where=text("status IN ('proposed','active')"),
+            postgresql_where=text("status IN ('proposed','active')"),
         ),
     )
 

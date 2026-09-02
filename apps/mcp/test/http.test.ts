@@ -309,8 +309,8 @@ test("HTTP MCP enforces bearer auth, body limits, and session lifecycle", async 
   assert.equal(afterDelete.status, 404);
 });
 
-test("HTTP team sessions pin the credential-derived AuthContext", async (context) => {
-  const stateDir = await mkdtemp(join(tmpdir(), "neuromem-mcp-team-http-test-"));
+test("HTTP Control sessions pin the credential-derived AuthContext", async (context) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "neuromem-mcp-control-http-test-"));
   const core = createServer((_request, response) => {
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ records: [], claims: [], record_snippets: [] }));
@@ -319,11 +319,12 @@ test("HTTP team sessions pin the credential-derived AuthContext", async (context
   const router = new FederatedMemoryRouter({ nodes: [{ id: "gateway", baseUrl: coreUrl, token: CORE_TOKEN }], stateDir });
   await router.ready();
   let currentCapabilities = ["*"];
+  let currentProject = PROJECT_ID;
   const auth = (credentialId: string): AuthContext => ({
     principal_id: "018f0f86-4d70-7a3c-8f2c-123456789abc",
     credential_id: credentialId,
     workspace_id: WORKSPACE_ID,
-    project_id: PROJECT_ID,
+    project_id: currentProject,
     human_peer_id: "018f0f86-4d71-7a3c-8f2c-123456789abc",
     agent_peer_id: "018f0f86-4d72-7a3c-8f2c-123456789abc",
     capabilities: currentCapabilities,
@@ -332,7 +333,7 @@ test("HTTP team sessions pin the credential-derived AuthContext", async (context
   const server = createMcpHttpServer({
     dispatcher: new MemoryToolDispatcher(router),
     credentialResolver: token => token === "credential-a" ? auth("credential-a") : token === "credential-b" ? auth("credential-b") : undefined,
-    authMode: "team"
+    authMode: "control"
   });
   const baseUrl = await listen(server);
   context.after(async () => { await Promise.all([close(server), close(core)]); await rm(stateDir, { recursive: true, force: true }); });
@@ -364,6 +365,16 @@ test("HTTP team sessions pin the credential-derived AuthContext", async (context
   assert.equal(narrowedTools.some((tool) => tool.name === "memory_record"), false);
   assert.equal(narrowedTools.some((tool) => tool.name === "recall"), true);
 
+  currentProject = "018f0f86-4d79-7a3c-8f2c-123456789abc";
+  const rebound = await fetch(`${baseUrl}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer credential-a", "mcp-session-id": sessionId },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 23, method: "tools/list" })
+  });
+  assert.equal(rebound.status, 401);
+  assert.deepEqual(await rebound.json(), { error: "MCP credential scope does not match the initialized session" });
+  currentProject = PROJECT_ID;
+
   const swapped = await fetch(`${baseUrl}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer credential-b", "mcp-session-id": sessionId },
@@ -373,7 +384,7 @@ test("HTTP team sessions pin the credential-derived AuthContext", async (context
   assert.deepEqual(await swapped.json(), { error: "MCP credential does not match the initialized session" });
 });
 
-test("Control credential resolver obtains a complete server-derived team scope", async (context) => {
+test("Control credential resolver obtains a complete server-derived scope", async (context) => {
   const expected: AuthContext = {
     principal_id: "018f0f86-4d70-7a3c-8f2c-123456789abc",
     credential_id: "018f0f86-4d71-7a3c-8f2c-123456789abc",
@@ -386,13 +397,13 @@ test("Control credential resolver obtains a complete server-derived team scope",
   };
   const control = createServer((request, response) => {
     assert.equal(request.url, "/api/v1/me");
-    assert.equal(request.headers.authorization, "Bearer team-credential");
+    assert.equal(request.headers.authorization, "Bearer control-credential");
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ principal: { id: expected.principal_id }, context: expected }));
   });
   const baseUrl = await listen(control);
   context.after(() => close(control));
   const resolver = createControlCredentialResolver(baseUrl);
-  assert.deepEqual(await resolver("team-credential"), expected);
+  assert.deepEqual(await resolver("control-credential"), expected);
   assert.throws(() => createControlCredentialResolver("ftp://control.invalid"), /HTTP\(S\)/);
 });

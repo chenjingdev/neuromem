@@ -32,15 +32,7 @@ const adminDist = path.join(assets, "admin-dist");
 await resetDirectory(adminDist);
 await fs.cp(webDist, adminDist, { recursive: true });
 
-await copyContext("core", [
-  "apps/core/.dockerignore",
-  "apps/core/Dockerfile",
-  "apps/core/pyproject.toml",
-  "apps/core/uv.lock",
-  "apps/core/alembic.ini",
-  "apps/core/alembic",
-  "apps/core/neuromem_core",
-]);
+await fs.rm(path.join(assets, "images", "core"), { recursive: true, force: true });
 await copyContext("control", [
   "apps/control/Dockerfile",
   "apps/control/pyproject.toml",
@@ -71,15 +63,15 @@ await copyContext("web", [
   "apps/web/src",
 ]);
 
-const teamAssets = path.join(assets, "team");
-await resetDirectory(teamAssets);
-for (const name of ["compose.yaml", "nginx.conf", "team.env.example", "README.md"]) {
-  await fs.copyFile(path.join(root, "deploy", "team", name), path.join(teamAssets, name));
+const nodeAssets = path.join(assets, "node");
+await resetDirectory(nodeAssets);
+for (const name of ["compose.yaml", "nginx.conf", "node.env.example", "README.md"]) {
+  await fs.copyFile(path.join(root, "deploy", "node", name), path.join(nodeAssets, name));
 }
 
 await fs.writeFile(
   path.join(assets, "build-manifest.json"),
-  `${JSON.stringify({ format: 1, version: "0.1.0", images: ["core", "control", "mcp", "web"], team_deployment: "assets/team/compose.yaml", memory_core_vendored: false }, null, 2)}\n`,
+  `${JSON.stringify({ format: 1, version: "0.1.0", images: ["control", "mcp", "web"], node_deployment: "assets/node/compose.yaml", memory_core_vendored: false }, null, 2)}\n`,
   { mode: 0o644 },
 );
 await fs.copyFile(path.join(root, "LICENSE"), path.join(managerRoot, "LICENSE"));

@@ -9,7 +9,8 @@ import {
   MemoryToolDispatcher,
   startHttpServerFromEnv,
   stopHttpServer,
-  TeamGatewayClient,
+  ControlGatewayClient,
+  ControlGatewayError,
   type AuthContext,
 } from "../src/index.js";
 
@@ -48,7 +49,7 @@ function auth(credential: string, project: string, human: string): AuthContext {
   };
 }
 
-test("team MCP isolates two credentials and exposes only Control Gateway-backed tools", async context => {
+test("Control MCP isolates two credentials and exposes only Control Gateway-backed tools", async context => {
   const tokenA = "credential-a-secret";
   const tokenB = "credential-b-secret";
   const contexts = new Map([[tokenA, auth("credential-a", PROJECT_A, HUMAN_A)], [tokenB, auth("credential-b", PROJECT_B, HUMAN_B)]]);
@@ -66,10 +67,10 @@ test("team MCP isolates two credentials and exposes only Control Gateway-backed 
   });
   const controlUrl = await listen(control);
   const mcp = createMcpHttpServer({
-    dispatcher: new MemoryToolDispatcher(undefined, { authMode: "team" }),
+    dispatcher: new MemoryToolDispatcher(undefined, { authMode: "control" }),
     credentialResolver: createControlCredentialResolver(controlUrl),
-    teamGateway: new TeamGatewayClient(controlUrl),
-    authMode: "team",
+    controlGateway: new ControlGatewayClient(controlUrl),
+    authMode: "control",
   });
   const mcpUrl = await listen(mcp);
   context.after(async () => Promise.all([close(mcp), close(control)]));
@@ -106,9 +107,9 @@ test("team MCP isolates two credentials and exposes only Control Gateway-backed 
   assert.equal(swapped.status, 401);
 });
 
-test("team HTTP startup requires only NEUROMEM_CONTROL_API_URL", async context => {
+test("Control HTTP startup requires only NEUROMEM_CONTROL_API_URL", async context => {
   await assert.rejects(startHttpServerFromEnv({
-    NEUROMEM_MCP_AUTH_MODE: "team",
+    NEUROMEM_MCP_AUTH_MODE: "control",
     NEUROMEM_MCP_TOKEN: "legacy-static-token",
     NEUROMEM_MCP_AUTH_CONTEXT: JSON.stringify(auth("credential-a", PROJECT_A, HUMAN_A)),
   }), /requires NEUROMEM_CONTROL_API_URL/);
@@ -123,4 +124,53 @@ test("team HTTP startup requires only NEUROMEM_CONTROL_API_URL", async context =
   const health = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), { status: "ok" });
+});
+
+test("Control Gateway bounds failures without reflecting bodies, following redirects, or hanging", async context => {
+  const secret = "upstream-secret-that-must-not-leak";
+  let redirected = false;
+  const redirectTarget = createServer((_request, response) => {
+    redirected = true;
+    response.end(secret);
+  });
+  const redirectUrl = await listen(redirectTarget);
+  const control = createServer((request, response) => {
+    if (request.url === "/api/v1/fail") {
+      response.statusCode = 500;
+      response.end(`failure body ${secret}`);
+      return;
+    }
+    if (request.url === "/api/v1/oversize") {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ value: "x".repeat(4_096) }));
+      return;
+    }
+    if (request.url === "/api/v1/redirect") {
+      response.statusCode = 302;
+      response.setHeader("location", redirectUrl);
+      response.end();
+      return;
+    }
+    response.setHeader("content-type", "application/json");
+    response.write('{"value":"partial');
+  });
+  const controlUrl = await listen(control);
+  context.after(async () => Promise.all([close(control), close(redirectTarget)]));
+  const gateway = new ControlGatewayClient(controlUrl, 40, 256);
+  const identity = auth("credential-a", PROJECT_A, HUMAN_A);
+
+  for (const [path, code] of [
+    ["/api/v1/fail", "gateway_http_500"],
+    ["/api/v1/oversize", "gateway_response_too_large"],
+    ["/api/v1/redirect", "gateway_unavailable"],
+    ["/api/v1/stalled", "gateway_timeout"],
+  ] as const) {
+    await assert.rejects(
+      gateway.request("GET", path, identity, "transient-bearer"),
+      error => error instanceof ControlGatewayError
+        && error.code === code
+        && !String(error).includes(secret),
+    );
+  }
+  assert.equal(redirected, false);
 });

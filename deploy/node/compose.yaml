@@ -1,4 +1,4 @@
-name: ${COMPOSE_PROJECT_NAME:-neuromem-team}
+name: ${COMPOSE_PROJECT_NAME:-neuromem-node}
 
 services:
   control-database:
@@ -120,11 +120,17 @@ services:
     restart: unless-stopped
     environment:
       NEUROMEM_CONTROL_DATABASE_URL: postgresql+psycopg://${CONTROL_POSTGRES_USER}:${CONTROL_POSTGRES_PASSWORD}@control-database:5432/${CONTROL_POSTGRES_DB}
+      NEUROMEM_CONTROL_NODE_ID: ${NEUROMEM_NODE_ID:?NEUROMEM_NODE_ID is required}
       NEUROMEM_CONTROL_TOKEN_PEPPER: ${CONTROL_TOKEN_PEPPER:?CONTROL_TOKEN_PEPPER is required}
       NEUROMEM_CONTROL_SECRET_KEY: ${CONTROL_TOKEN_PEPPER:?CONTROL_TOKEN_PEPPER is required}
       NEUROMEM_CONTROL_INTERNAL_SIGNING_KEY: ${CONTROL_INTERNAL_SIGNING_KEY:?CONTROL_INTERNAL_SIGNING_KEY is required}
+      NEUROMEM_CONTROL_SECURE_COOKIES: ${CONTROL_SECURE_COOKIES:-true}
+      NEUROMEM_CONTROL_LOCAL_TEST_LOGIN_PREFILL: ${LOCAL_TEST_LOGIN_PREFILL:-false}
+      NEUROMEM_CONTROL_LOCAL_TEST_LOGIN_EMAIL: ${LOCAL_TEST_LOGIN_EMAIL:-}
+      NEUROMEM_CONTROL_LOCAL_TEST_LOGIN_PASSWORD: ${LOCAL_TEST_LOGIN_PASSWORD:-}
       NEUROMEM_CONTROL_MEMORY_CORE_URL: http://memory-core:8000
-      NEUROMEM_PUBLIC_BASE_URL: https://${NEUROMEM_PUBLIC_HOST:?NEUROMEM_PUBLIC_HOST is required}
+      NEUROMEM_CONTROL_NODE_MANAGER_URL: ${NODE_MANAGER_URL:-http://host.docker.internal:14174}
+      NEUROMEM_CONTROL_NODE_MANAGER_TIMEOUT_SECONDS: ${NODE_MANAGER_TIMEOUT_SECONDS:-600}
       NEUROMEM_TRUSTED_PROXY_COUNT: "1"
     depends_on:
       control-database: { condition: service_healthy }
@@ -135,6 +141,8 @@ services:
       timeout: 5s
       retries: 30
     networks: [frontend, backend]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   mcp:
     image: ${MCP_IMAGE:-neuromem-mcp:local}
@@ -145,7 +153,8 @@ services:
       PORT: 3001
       HOST: 0.0.0.0
       NEUROMEM_CONTROL_API_URL: http://control:8000
-      NEUROMEM_MCP_AUTH_MODE: team
+      # Credential scope is resolved by the Control plane's Workspace/Project model.
+      NEUROMEM_MCP_AUTH_MODE: control
       NEUROMEM_MCP_ALLOW_REMOTE: "true"
       NEUROMEM_PUBLIC_HOST: ${NEUROMEM_PUBLIC_HOST:?NEUROMEM_PUBLIC_HOST is required}
       NEUROMEM_MCP_STATE_DIR: /var/lib/neuromem-mcp

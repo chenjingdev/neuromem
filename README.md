@@ -1,15 +1,41 @@
 # Neuromem
 
-Neuromem is a source-grounded memory engine for people and AI agents. It stores immutable records first, derives explicit claims asynchronously, and keeps every derived view traceable to its source.
+Neuromem is a source-grounded memory engine for people and AI agents. It stores
+immutable records first, derives explicit claims asynchronously, and keeps every
+derived view traceable to its source.
+
+## Product model
+
+Neuromem is one platform; it does not have separate Personal and Team modes.
+
+```text
+Physical Node (one Mac, DGX Spark, or server)
+└── Workspace (ownership, membership, and memory-isolation boundary)
+    └── Project (working memory, recall, derivation, Dream, and Wiki boundary)
+```
+
+- One physical device runs one monolithic Node.
+- One Node can host many Workspaces.
+- One Workspace can contain many Projects.
+- Workspaces share no memory by default.
+- An Owner can propose a directional share to another Workspace, but an Owner
+  of the recipient Workspace must also approve it.
+- A share can appear in the recipient UI as a grouped external Workspace or as
+  only the approved Projects. Either side's Owner can revoke it immediately.
+
+Node operators manage Docker services, compute sources, Codex/API model
+connections, logs, and recovery. Workspace Owners manage members, Projects,
+credentials, and memory-sharing agreements.
 
 ## Repository layout
 
-- `apps/core` — FastAPI data API and durable workers
-- `apps/manager` — local Node Manager and `neuromem` CLI
-- `apps/mcp` — direct Node MCP adapter and multi-node router
-- `apps/web` — memory application and local administration UI
-- `deploy` — parameterized container deployment
-- `tests` — cross-service contract and end-to-end tests
+- `apps/core` — Neuromem data-plane API and worker implementation
+- `apps/control` — Node gateway, identity, authorization, and Workspace sharing
+- `apps/manager` — host-local Node Manager and `neuromem` CLI
+- `apps/mcp` — credential-bound MCP adapter
+- `apps/web` — Workspace product and host-only Node management UI
+- `deploy/node` — monolithic physical Node Compose deployment
+- `tests` — cross-service deployment and contract tests
 
 ## Development
 
@@ -19,45 +45,21 @@ Requirements:
 - Python 3.12+
 - Docker with Compose
 
-Install JavaScript dependencies:
+Install dependencies and run the repository tests:
 
 ```sh
 npm install
-```
-
-Install the Core in a virtual environment:
-
-```sh
 python3 -m venv .venv
 .venv/bin/pip install -e 'apps/core[dev]'
-```
 
-Run unit tests:
-
-```sh
 npm test
 .venv/bin/pytest apps/core/tests
 ```
 
-Start an isolated development Node:
+## Install the local CLI
 
-```sh
-cp deploy/nodes/personal.env.example deploy/nodes/personal.env
-docker compose -p neuromem-personal --env-file deploy/nodes/personal.env -f deploy/compose.yaml up --build
-```
-
-The default local endpoints are:
-
-- Memory app: `http://127.0.0.1:14173`
-- Core API: `http://127.0.0.1:18001`
-- MCP: `http://127.0.0.1:18765/mcp`
-
-PostgreSQL is not published to the host.
-
-## Run the local product
-
-The npm package is not published by this repository. Build and install the local
-tarball for an end-to-end installation test:
+The npm package is not published by this repository. Build a local tarball and
+install that exact artifact for an end-to-end test:
 
 ```sh
 npm install
@@ -66,64 +68,79 @@ npm pack --workspace neuromem
 npm install -g ./neuromem-0.1.0.tgz
 ```
 
-Docker is required. An OpenAI-compatible model endpoint is optional for raw
-record storage but required for embeddings, Claims, Wiki, and Graph. With the
-models already available in local Ollama, start the default Personal Node with:
+Package installation has no lifecycle script and does not start services.
+
+## Configure and start this Node
+
+`neuromem` creates the missing private Node configuration, starts the complete
+Node, verifies its services and compute sources, and opens the application. Use
+this fast path when the configured model endpoints are already available:
 
 ```sh
-EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1 \
-EMBEDDING_API_KEY=ollama \
-EMBEDDING_MODEL=qwen3-embedding:4b \
-GENERATION_BASE_URL=http://host.docker.internal:11434/v1 \
-GENERATION_API_KEY=ollama \
-GENERATION_MODEL=gpt-oss:20b \
 neuromem
 ```
 
-The explicit `neuromem` command prepares missing local runtime images, starts
-the whole Node, checks it, and opens `/app`. Package installation itself does
-not change host services.
+For an explicit first setup, initialize the private `0600` configuration and
+edit the path returned by the command before starting:
+
+```sh
+neuromem node config init
+neuromem node config validate
+neuromem node preflight --target auto
+neuromem node start --target auto
+```
+
+The default local application is `http://localhost:24443`; MCP is available at
+`http://localhost:24443/mcp`. No database, Redis, or Memory Core port is
+published to the host.
 
 Useful commands:
 
 ```sh
 neuromem node status
-neuromem node logs
-neuromem node backup create
-neuromem admin open
-neuromem node mcp-config --format toml
+neuromem node compute status
+neuromem node logs --service control --tail 200
+neuromem node admin open
+neuromem node mcp-config --credential-file /private/credential --format toml
+neuromem node backup rehearse
+neuromem node migrate rehearse --target-revision head
+neuromem node stop
 neuromem skill path
 ```
 
-`/app` is the memory product. `/admin` remains available from the host-side
-Manager even when the database or Core API is unavailable. Restore and schema
-migration apply operations are CLI-only.
+`neuromem node admin open` opens the host-only Node management surface. Compute
+configuration belongs to the Node and is shared by all of its Workspaces. The
+generation source can reuse the local Codex login or use an OpenAI-compatible
+API; embedding and generation health are reported separately.
 
-## Team memory architecture
+## Workspace and Project operation
 
-The team product adds a sovereign Workspace control plane without treating a
-memory Peer as an authentication identity:
+The first bootstrap creates an Owner, a Workspace, and its first Project. From
+the application, a user can create additional Workspaces and Projects and
+switch the active scope. A Principal is the authentication and permission
+subject; each membership receives a distinct Human Peer, and Codex, Claude, or
+other agents use separate Agent Peers.
 
-- a Principal is the login, credential, and permission subject;
-- every Principal receives a separate canonical Human Peer in each Workspace;
-- Codex, Claude, shared agents, and services receive their own Agent Peers;
-- a Workspace is the ownership and membership boundary;
-- a Project is the session, recall, derivation, Dream, and Wiki boundary;
-- the default context is the Workspace General Project plus the active Project.
+Sharing is a read-only projection, not implicit memory copying:
 
-Workspace federation is explicit and read-only. Both Workspace admins approve
-the connection, the source admin grants selected Projects, and the target admin
-assigns that grant to selected local members. Permanent transfer is a separate,
-two-sided approval that writes a new target Message and derives memory again.
+1. An Owner proposes a target Workspace and display mode.
+2. An Owner of the target Workspace approves or rejects the request.
+3. An approved `workspace` display groups all current active source Projects.
+4. An approved `projects` display shows only the explicitly selected Projects.
+5. Revocation immediately removes both the UI projection and federated search
+   access.
 
-The team deployment lives in `deploy/team`. It exposes only Web, Control API,
-and MCP through Cloudflare Tunnel. Databases, Redis, models, and Memory Core are
-private services. The Control Plane is Apache-2.0; the separately distributed
-Memory Core is derived from Honcho v3.1.0 and remains AGPL-3.0-only. The exact
-source boundary is recorded in `SOURCE_MANIFEST.json`.
+Permanent copying remains a separate, audited transfer flow that derives new
+memory inside the recipient Project.
 
-```sh
-cp deploy/team/team.env.example /private/path/team.env
-docker compose --env-file /private/path/team.env \
-  -f deploy/team/compose.yaml config --quiet
-```
+## Deployment and source boundary
+
+See [`deploy/node/README.md`](deploy/node/README.md) for local, DGX, and
+Cloudflare deployment instructions.
+
+The edge exposes only Web, Control API, and MCP. Databases, Redis, model
+services, and Memory Core remain private. The Apache-2.0 package includes
+Control, Manager, MCP, Web, and deployment inputs. The separately distributed
+Memory Core is derived from Honcho v3.1.0 and remains AGPL-3.0-only; its image is
+pinned by digest and its exact source URL and revision are recorded in the Node
+configuration and `SOURCE_MANIFEST.json`.

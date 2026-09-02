@@ -26,10 +26,12 @@ export function statusLabel(state: string) {
     verified: "검증됨",
     invalid: "검증 실패",
     active: "사용 중",
+    inactive: "사용 안 함",
     proposed: "제안",
     adopted: "채택",
     disputed: "분쟁",
     rejected: "기각",
+    revoked: "해제됨",
     superseded: "대체됨",
   } as Record<string, string>)[state] || state;
 }

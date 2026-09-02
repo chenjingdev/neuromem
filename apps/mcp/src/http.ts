@@ -7,7 +7,7 @@ import { loadMcpAuthConfig, loadRouterConfig } from "./config.js";
 import { uuid7 } from "./ids.js";
 import { dispatchRpc, type JsonRpcRequest, RpcError, rpcErrorMessage, validJsonRpcId } from "./rpc.js";
 import { FederatedMemoryRouter } from "./router.js";
-import { TeamGatewayClient } from "./team-gateway-client.js";
+import { ControlGatewayClient } from "./control-gateway-client.js";
 import { MemoryToolDispatcher, type McpAuthMode } from "./tools.js";
 import type { AuthContext, CredentialResolver, JsonObject } from "./types.js";
 
@@ -16,6 +16,7 @@ const managedRouters = new WeakMap<Server, FederatedMemoryRouter>();
 interface Session {
   lastSeenAt: number;
   credentialId?: string;
+  authIdentity?: string;
 }
 
 export interface McpHttpServerOptions {
@@ -23,7 +24,7 @@ export interface McpHttpServerOptions {
   bearerToken?: string;
   authContext?: AuthContext;
   credentialResolver?: CredentialResolver;
-  teamGateway?: TeamGatewayClient;
+  controlGateway?: ControlGatewayClient;
   authMode?: McpAuthMode;
   allowRemoteAccess?: boolean;
   maxBodyBytes?: number;
@@ -75,6 +76,19 @@ function tokenMatches(header: string | undefined, expected: string): boolean {
 function bearerValue(header: string | undefined): string | undefined {
   const value = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
   return value || undefined;
+}
+
+function authContextIdentity(context: AuthContext): string {
+  const identity = [
+    context.principal_id,
+    context.credential_id,
+    context.workspace_id,
+    context.project_id,
+    context.human_peer_id,
+    context.agent_peer_id ?? null,
+    context.client ?? null,
+  ];
+  return createHash("sha256").update(JSON.stringify(identity)).digest("base64url");
 }
 
 async function readBoundedJsonResponse(response: Response, maximum: number): Promise<unknown> {
@@ -209,18 +223,19 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
     }
   }
 
-  function requireSession(request: IncomingMessage, credentialId?: string): { id: string; session: Session } {
+  function requireSession(request: IncomingMessage, credentialId?: string, authIdentity?: string): { id: string; session: Session } {
     pruneSessions();
     const id = headerValue(request.headers["mcp-session-id"]);
     const session = id ? sessions.get(id) : undefined;
     if (!id) throw new HttpInputError(400, "Mcp-Session-Id is required");
     if (!session) throw new HttpInputError(404, "MCP session not found");
     if (session.credentialId !== credentialId) throw new HttpInputError(401, "MCP credential does not match the initialized session");
+    if (session.authIdentity !== authIdentity) throw new HttpInputError(401, "MCP credential scope does not match the initialized session");
     session.lastSeenAt = Date.now();
     return { id, session };
   }
 
-  async function authenticate(request: IncomingMessage): Promise<{ dispatcher: MemoryToolDispatcher; credentialId?: string } | undefined> {
+  async function authenticate(request: IncomingMessage): Promise<{ dispatcher: MemoryToolDispatcher; credentialId?: string; authIdentity?: string } | undefined> {
     const authorization = headerValue(request.headers.authorization);
     const token = bearerValue(authorization);
     if (!token) return undefined;
@@ -228,17 +243,19 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
       const authContext = await options.credentialResolver(token);
       if (!authContext) return undefined;
       return {
-        dispatcher: options.teamGateway
-          ? options.dispatcher.withTeamRequest(authContext, options.teamGateway, token)
-          : options.dispatcher.withAuthContext(authContext, options.authMode ?? "team"),
-        credentialId: authContext.credential_id
+        dispatcher: options.controlGateway
+          ? options.dispatcher.withControlRequest(authContext, options.controlGateway, token)
+          : options.dispatcher.withAuthContext(authContext, options.authMode ?? "control"),
+        credentialId: authContext.credential_id,
+        authIdentity: authContextIdentity(authContext)
       };
     }
     if (!options.bearerToken || !tokenMatches(authorization, options.bearerToken)) return undefined;
     if (options.authContext) {
       return {
         dispatcher: options.dispatcher.withAuthContext(options.authContext, options.authMode ?? "hybrid"),
-        credentialId: options.authContext.credential_id
+        credentialId: options.authContext.credential_id,
+        authIdentity: authContextIdentity(options.authContext)
       };
     }
     return { dispatcher: options.dispatcher };
@@ -266,13 +283,13 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
         return;
       }
       if (request.method === "GET") {
-        requireSession(request, authenticated.credentialId);
+        requireSession(request, authenticated.credentialId, authenticated.authIdentity);
         response.writeHead(405, { allow: "POST, DELETE", "cache-control": "no-store" });
         response.end();
         return;
       }
       if (request.method === "DELETE") {
-        const { id: sessionId } = requireSession(request, authenticated.credentialId);
+        const { id: sessionId } = requireSession(request, authenticated.credentialId, authenticated.authIdentity);
         sessions.delete(sessionId);
         response.writeHead(204, { "cache-control": "no-store" });
         response.end();
@@ -289,7 +306,7 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
         if (incoming.some((rpc) => rpc.method === "initialize")) {
           throw new HttpInputError(400, "initialize must be a single request");
         }
-        const { id: sessionId } = requireSession(request, authenticated.credentialId);
+        const { id: sessionId } = requireSession(request, authenticated.credentialId, authenticated.authIdentity);
         const replies = (await Promise.all(incoming.map((rpc) => rpcEnvelope(authenticated.dispatcher, rpc))))
           .filter((reply): reply is JsonObject => reply !== undefined);
         if (replies.length === 0) {
@@ -309,9 +326,13 @@ export function createMcpHttpServer(options: McpHttpServerOptions): Server {
         pruneSessions();
         if (sessions.size >= maxSessions) throw new HttpInputError(503, "session capacity reached");
         sessionId = uuid7();
-        sessions.set(sessionId, { lastSeenAt: Date.now(), credentialId: authenticated.credentialId });
+        sessions.set(sessionId, {
+          lastSeenAt: Date.now(),
+          credentialId: authenticated.credentialId,
+          authIdentity: authenticated.authIdentity,
+        });
       } else {
-        sessionId = requireSession(request, authenticated.credentialId).id;
+        sessionId = requireSession(request, authenticated.credentialId, authenticated.authIdentity).id;
       }
 
       try {
@@ -405,15 +426,15 @@ export async function startHttpServerFromEnv(env: NodeJS.ProcessEnv = process.en
     throw new Error("NEUROMEM_MCP_TOKEN must be at least 16 bytes");
   }
   const auth = loadMcpAuthConfig(env);
-  if (auth.mode === "team" && !controlUrl) {
-    throw new Error("team HTTP mode requires NEUROMEM_CONTROL_API_URL");
+  if (auth.mode === "control" && !controlUrl) {
+    throw new Error("control auth requires NEUROMEM_CONTROL_API_URL");
   }
   let router: FederatedMemoryRouter | undefined;
-  let teamGateway: TeamGatewayClient | undefined;
+  let controlGateway: ControlGatewayClient | undefined;
   let dispatcher: MemoryToolDispatcher;
   if (controlUrl) {
-    teamGateway = new TeamGatewayClient(controlUrl);
-    dispatcher = new MemoryToolDispatcher(undefined, { authMode: "team" });
+    controlGateway = new ControlGatewayClient(controlUrl);
+    dispatcher = new MemoryToolDispatcher(undefined, { authMode: "control" });
   } else {
     router = new FederatedMemoryRouter(loadRouterConfig(env));
     await router.ready();
@@ -424,7 +445,7 @@ export async function startHttpServerFromEnv(env: NodeJS.ProcessEnv = process.en
     dispatcher,
     bearerToken: token,
     credentialResolver: controlUrl ? createControlCredentialResolver(controlUrl) : undefined,
-    teamGateway,
+    controlGateway,
     authContext: auth.context,
     authMode: auth.mode,
     allowRemoteAccess: env.NEUROMEM_MCP_ALLOW_REMOTE === "true",

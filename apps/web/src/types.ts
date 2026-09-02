@@ -16,6 +16,18 @@ export interface WorkspaceOption {
 export interface ProjectOption {
   id: string;
   name: string;
+  workspace_id?: string;
+  slug?: string;
+  status?: string;
+}
+
+export interface ProjectFolderBinding {
+  id: string;
+  project_id: string;
+  display_name: string;
+  display_path: string;
+  status: string;
+  updated_at: string;
 }
 
 export type WorkspaceRole = "owner" | "admin" | "contributor" | "viewer";
@@ -72,27 +84,42 @@ export interface ProjectGrant {
   created_at?: string;
 }
 
-export type WorkspaceLinkStatus = "proposed" | "active" | "rejected" | "revoked";
+export type WorkspaceShareDisplayMode = "workspace" | "projects";
+export type WorkspaceShareStatus = "proposed" | "active" | "rejected" | "revoked";
 
-export interface WorkspaceLink {
+/**
+ * A two-owner agreement that projects memory from one Workspace into another.
+ * `workspace` preserves the source Workspace as a group in the recipient UI;
+ * `projects` flattens only the approved projects into the recipient UI.
+ */
+export interface WorkspaceShare {
   id: string;
-  source_workspace_id: string;
-  target_workspace_id: string;
-  target_workspace_name?: string;
-  status: WorkspaceLinkStatus;
-  proposed_by?: string;
+  owner_workspace_id: string;
+  owner_workspace_name?: string;
+  recipient_workspace_id: string;
+  recipient_workspace_name?: string;
+  display_mode: WorkspaceShareDisplayMode;
+  project_refs: ProjectOption[];
+  owner_approved_at: string | null;
+  recipient_approved_at: string | null;
+  status: WorkspaceShareStatus;
   created_at?: string;
+  updated_at?: string;
 }
 
-export interface FederatedProjectGrant {
-  id: string;
-  workspace_link_id: string;
-  source_workspace_id: string;
-  source_project_id: string;
-  source_project_name?: string;
-  target_workspace_id: string;
-  capabilities: Array<"search" | "read_source" | string>;
-  status: "proposed" | "active" | "revoked" | string;
+export interface WorkspaceShareProposal {
+  recipient_workspace_id: string;
+  display_mode: WorkspaceShareDisplayMode;
+  project_ids: string[];
+}
+
+/** Read-only memory projected into the currently selected recipient Workspace. */
+export interface WorkspaceProjection {
+  share_id: string;
+  owner_workspace_id: string;
+  owner_workspace_name?: string;
+  display_mode: WorkspaceShareDisplayMode;
+  project_refs: ProjectOption[];
 }
 
 export interface TransferRequest {
@@ -116,13 +143,13 @@ export interface PeerBinding {
   agent_peers: AgentPeerBinding[];
 }
 
-export interface TeamDashboard {
+export interface WorkspaceDashboard {
   members: WorkspaceMember[];
   peer_bindings: PeerBinding[];
   credentials: ApiCredential[];
   project_grants: ProjectGrant[];
-  workspace_links: WorkspaceLink[];
-  federated_grants: FederatedProjectGrant[];
+  shares: WorkspaceShare[];
+  projections: WorkspaceProjection[];
   transfer_requests: TransferRequest[];
 }
 

@@ -10,14 +10,12 @@ from sqlalchemy.orm import Session
 from .core_client import MemoryCoreClient, MemoryCoreError, get_memory_core_client
 from .db import db_session
 from .models import (
-    FederatedGrantAssignment,
-    FederatedProjectGrant,
     Project,
     WikiCitation,
     WikiPage,
     WikiRevision,
-    WorkspaceLink,
     WorkspaceMembership,
+    WorkspaceShare,
 )
 from .schemas import (
     AuthContext,
@@ -33,7 +31,7 @@ from .schemas import (
     MemorySessionCreate,
 )
 from .security import CurrentAuth, require_capability
-from .services import audit_auth
+from .services import audit_auth, workspace_share_projects
 
 router = APIRouter(prefix="/api/v1")
 Database = Annotated[Session, Depends(db_session)]
@@ -304,9 +302,9 @@ def _search_local(
     return records[: body.limit], claims[: body.limit]
 
 
-def _federated_grants(
+def _shared_projects(
     db: Session, auth: CurrentAuth
-) -> list[tuple[FederatedProjectGrant, WorkspaceLink]]:
+) -> list[tuple[WorkspaceShare, Project]]:
     workspace_id = auth.context.workspace_id
     if workspace_id is None:
         return []
@@ -319,31 +317,17 @@ def _federated_grants(
     )
     if membership is None:
         return []
-    rows = db.execute(
-        select(FederatedProjectGrant, WorkspaceLink)
-        .join(
-            WorkspaceLink,
-            WorkspaceLink.id == FederatedProjectGrant.workspace_link_id,
+    shares = db.scalars(
+        select(WorkspaceShare).where(
+            WorkspaceShare.recipient_workspace_id == workspace_id,
+            WorkspaceShare.status == "active",
         )
-        .where(
-            FederatedProjectGrant.target_workspace_id == workspace_id,
-            FederatedProjectGrant.status == "active",
-            WorkspaceLink.status == "active",
-        )
-    ).all()
-    visible: list[tuple[FederatedProjectGrant, WorkspaceLink]] = []
-    for grant, link in rows:
-        assignment = db.scalar(
-            select(FederatedGrantAssignment.id).where(
-                FederatedGrantAssignment.federated_grant_id == grant.id,
-                FederatedGrantAssignment.status == "active",
-                (FederatedGrantAssignment.principal_id == auth.principal.id)
-                | (FederatedGrantAssignment.role == membership.role),
-            )
-        )
-        if assignment and "search" in grant.capabilities:
-            visible.append((grant, link))
-    return visible
+    )
+    return [
+        (share, project)
+        for share in shares
+        for project in workspace_share_projects(db, share)
+    ]
 
 
 def _search_federated(
@@ -354,29 +338,20 @@ def _search_federated(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     claims: list[dict[str, Any]] = []
-    for grant, link in _federated_grants(db, auth):
-        source_project = db.scalar(
-            select(Project).where(
-                Project.id == grant.source_project_id,
-                Project.workspace_id == link.source_workspace_id,
-                Project.status == "active",
-            )
-        )
-        if source_project is None:
-            continue
+    for share, source_project in _shared_projects(db, auth):
         source_context = auth.context.model_copy(
             update={
-                "workspace_id": link.source_workspace_id,
-                "project_id": grant.source_project_id,
+                "workspace_id": share.owner_workspace_id,
+                "project_id": source_project.id,
                 "human_peer_id": None,
                 "agent_peer_id": None,
-                "capabilities": ["federated.search", "project.read"],
+                "capabilities": ["workspace_share.search", "project.read"],
             }
         )
         source_body = body.model_copy(
             update={
-                "workspace_id": link.source_workspace_id,
-                "project_id": grant.source_project_id,
+                "workspace_id": share.owner_workspace_id,
+                "project_id": source_project.id,
                 "include_general": False,
                 "include_federated": False,
             }
@@ -386,9 +361,9 @@ def _search_federated(
         )
         provenance = {
             "federated": True,
-            "federated_grant_id": grant.id,
-            "source_workspace_id": link.source_workspace_id,
-            "source_project_id": grant.source_project_id,
+            "workspace_share_id": share.id,
+            "source_workspace_id": share.owner_workspace_id,
+            "source_project_id": source_project.id,
         }
         records.extend({**item, **provenance} for item in source_records)
         claims.extend({**item, **provenance} for item in source_claims)
@@ -1058,14 +1033,14 @@ def compile_dynamic_context(
         identifier = str(item.get("record_id") or item.get("claim_id") or "")
         if not builder.add(
             layer="federated_source" if federated else "source",
-            title="Federated Source" if federated else "Relevant Source",
+            title="Shared Source" if federated else "Relevant Source",
             content=str(item.get("matched_content") or item.get("content") or ""),
             source_ids=[identifier] if identifier else [],
             provenance={
                 key: item[key]
                 for key in (
                     "project_id",
-                    "federated_grant_id",
+                    "workspace_share_id",
                     "source_workspace_id",
                     "source_project_id",
                 )

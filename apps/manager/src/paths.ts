@@ -10,10 +10,11 @@ export interface ManagerPaths {
   registry: string;
   adminToken: string;
   adminNonces: string;
+  folderSources: string;
   managerLog: string;
-  team: string;
-  teamEnv: string;
-  teamBackups: string;
+  node: string;
+  nodeEnv: string;
+  nodeBackups: string;
 }
 
 export function resolveManagerPaths(env: NodeJS.ProcessEnv = process.env): ManagerPaths {
@@ -28,6 +29,7 @@ export function resolveManagerPaths(env: NodeJS.ProcessEnv = process.env): Manag
       ? path.join(env.XDG_RUNTIME_DIR, "neuromem")
       : path.join(home, "run");
   const manager = path.join(home, "manager");
+  const node = path.join(home, "node");
   return {
     home,
     manager,
@@ -37,10 +39,11 @@ export function resolveManagerPaths(env: NodeJS.ProcessEnv = process.env): Manag
     registry: path.join(manager, "registry.json"),
     adminToken: path.join(manager, "admin.token"),
     adminNonces: path.join(manager, "admin-nonces.json"),
+    folderSources: path.join(manager, "folder-sources.json"),
     managerLog: path.join(manager, "manager.log"),
-    team: path.join(home, "team"),
-    teamEnv: path.join(home, "team", "team.env"),
-    teamBackups: path.join(home, "team", "backups"),
+    node,
+    nodeEnv: path.join(node, "node.env"),
+    nodeBackups: path.join(node, "backups"),
   };
 }
 

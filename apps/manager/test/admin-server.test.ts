@@ -6,6 +6,7 @@ import { AdminServer } from "../src/admin-server.js";
 import { ManagerClient } from "../src/client.js";
 import { uuid7 } from "../src/fs-safe.js";
 import { NodeManager } from "../src/node-manager.js";
+import { NodeDeploymentManager } from "../src/node-deployment-manager.js";
 import { FakeRunner, fakeCodex, freePort, okFetch, temporaryPaths, threeFreePorts } from "./helpers.js";
 
 test("Admin HTTP survives independently, exchanges one-time auth, and protects API routes", async t => {
@@ -50,7 +51,7 @@ test("Admin static server denies traversal and applies immutable cache only to a
   const { home, paths } = await temporaryPaths();
   const web = path.join(home, "web");
   await fs.mkdir(path.join(web, "assets"), { recursive: true });
-  await fs.writeFile(path.join(web, "index.html"), "admin-index");
+  await fs.writeFile(path.join(web, "index.html"), '<script type="module" src="./assets/app-abc.js"></script>');
   await fs.writeFile(path.join(web, "assets", "app-abc.js"), "asset-body");
   await fs.writeFile(path.join(home, "secret.txt"), "secret-body");
   await fs.symlink(path.join(home, "secret.txt"), path.join(web, "assets", "escape.js"));
@@ -59,11 +60,17 @@ test("Admin static server denies traversal and applies immutable cache only to a
   await server.start();
   t.after(async () => { await server.stop(); await fs.rm(home, { recursive: true, force: true }); });
   const base = `http://127.0.0.1:${port}`;
-  const index = await fetch(`${base}/admin`);
-  assert.equal(await index.text(), "admin-index");
+  const redirect = await fetch(`${base}/admin`, { redirect: "manual" });
+  assert.equal(redirect.status, 308);
+  assert.equal(redirect.headers.get("location"), "/admin/");
+  const index = await fetch(`${base}/admin/`);
+  assert.match(await index.text(), /\.\/assets\/app-abc\.js/);
   assert.equal(index.headers.get("cache-control"), "no-store");
-  const asset = await fetch(`${base}/admin/assets/app-abc.js`);
+  const assetUrl = new URL("./assets/app-abc.js", index.url);
+  assert.equal(assetUrl.pathname, "/admin/assets/app-abc.js");
+  const asset = await fetch(assetUrl);
   assert.equal(await asset.text(), "asset-body");
+  assert.match(asset.headers.get("content-type")!, /text\/javascript/);
   assert.match(asset.headers.get("cache-control")!, /immutable/);
   const traversal = await fetch(`${base}/admin/%2e%2e/secret.txt`);
   assert.notEqual(await traversal.text(), "secret-body");
@@ -177,6 +184,59 @@ test("internal Codex bridge binds bearer authorization to one Node and returns a
   assert.doesNotMatch(JSON.stringify(completion), new RegExp(`${escapeRegExp(nodeToken)}|${escapeRegExp(otherNodeToken)}`));
 });
 
+test("Admin exposes the single physical deployment Node and its compute sources", async t => {
+  const { home, paths } = await temporaryPaths();
+  const deploymentDir = path.join(home, "deployment");
+  await fs.mkdir(deploymentDir, { recursive: true });
+  await fs.writeFile(path.join(deploymentDir, "compose.yaml"), "services: {}\n");
+  await fs.mkdir(paths.node, { recursive: true });
+  const bridgeToken = "bridge-" + "x".repeat(40);
+  await fs.writeFile(paths.nodeEnv, physicalNodeEnv(bridgeToken), { mode: 0o600 });
+  await fs.chmod(paths.nodeEnv, 0o600);
+  const port = await freePort();
+  const runner = new FakeRunner();
+  const deploymentCodex = fakeCodex();
+  const modelFetch: typeof fetch = (async input => {
+    const url = String(input);
+    if (url.endsWith("/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "qwen3-embedding" }, { id: "gpt-5.6-terra" }] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ status: "ok", provider: "openai-codex", default_model: "gpt-5.6-terra" }), { status: 200 });
+  }) as typeof fetch;
+  const legacy = new NodeManager({ codex: fakeCodex(), paths, runner, fetch: okFetch() });
+  const deployment = new NodeDeploymentManager({ paths, runner, deploymentDir, managerPort: port, codex: deploymentCodex, fetch: modelFetch });
+  const server = new AdminServer({ manager: legacy, deployment, paths, port });
+  await server.start();
+  t.after(async () => { await server.stop(); await fs.rm(home, { recursive: true, force: true }); });
+
+  const client = new ManagerClient(paths);
+  const bootstrap = await client.request<{ token: string }>("POST", "/v1/admin/bootstrap", {});
+  const base = `http://127.0.0.1:${port}`;
+  const exchange = await fetch(`${base}/v1/admin/session`, {
+    method: "POST", headers: { origin: base, "content-type": "application/json" }, body: JSON.stringify({ token: bootstrap.token }),
+  });
+  const cookie = exchange.headers.get("set-cookie")!.split(";")[0]!;
+  const nodes = await fetch(`${base}/v1/nodes`, { headers: { origin: base, cookie } }).then(response => response.json()) as { nodes: Array<{ node_id: string }> };
+  assert.deepEqual(nodes.nodes.map(node => node.node_id), ["physical-node"]);
+  const models = await fetch(`${base}/v1/nodes/physical-node/models`, { headers: { origin: base, cookie } }).then(response => response.json()) as { node_id: string; generation: { active_source: string } };
+  assert.equal(models.node_id, "physical-node");
+  assert.equal(models.generation.active_source, "codex_session");
+
+  const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] };
+  const completion = await fetch(`${base}/v1/internal/codex/nodes/physical-node/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${bridgeToken}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-5.6-terra",
+      messages: [{ role: "user", content: "Return JSON" }],
+      response_format: { type: "json_schema", json_schema: { schema } },
+    }),
+  });
+  assert.equal(completion.status, 200);
+  assert.deepEqual(JSON.parse((await completion.json() as { choices: Array<{ message: { content: string } }> }).choices[0]!.message.content), { ok: true });
+  assert.doesNotMatch(JSON.stringify(models), new RegExp(escapeRegExp(bridgeToken)));
+});
+
 test("CLI-only Node creation is unreachable over TCP", async t => {
   const { home, paths } = await temporaryPaths();
   const port = await freePort();
@@ -228,6 +288,47 @@ function envValue(source: string, key: string): string {
   return value.startsWith('"') && value.endsWith('"')
     ? value.slice(1, -1).replaceAll('\\"', '"').replaceAll("\\\\", "\\")
     : value;
+}
+
+function physicalNodeEnv(bridgeToken: string): string {
+  const secret = "s".repeat(40);
+  return [
+    "COMPOSE_PROJECT_NAME=neuromem-node",
+    "NEUROMEM_NODE_ID=physical-node",
+    "NEUROMEM_PUBLIC_HOST=localhost",
+    "EDGE_LOOPBACK_PORT=24443",
+    "CONTROL_POSTGRES_DB=neuromem_control",
+    "CONTROL_POSTGRES_USER=neuromem_control",
+    `CONTROL_POSTGRES_PASSWORD=${secret}`,
+    `CONTROL_TOKEN_PEPPER=${secret}`,
+    `CONTROL_INTERNAL_SIGNING_KEY=${secret}`,
+    "MEMORY_POSTGRES_DB=neuromem_memory",
+    "MEMORY_POSTGRES_USER=neuromem_memory",
+    `MEMORY_POSTGRES_PASSWORD=${secret}`,
+    `MEMORY_REDIS_PASSWORD=${secret}`,
+    `MEMORY_INTERNAL_SIGNING_KEY=${secret}`,
+    `MEMORY_AUTH_JWT_SECRET=${secret}`,
+    `MEMORY_CORE_IMAGE=example.test/core@sha256:${"a".repeat(64)}`,
+    "MEMORY_CORE_SOURCE_URL=https://example.test/core",
+    "MEMORY_CORE_SOURCE_REVISION=abcdef1",
+    "EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1",
+    "EMBEDDING_API_KEY=local-model",
+    "EMBEDDING_MODEL=qwen3-embedding",
+    "GENERATION_SOURCE=codex_session",
+    "GENERATION_BASE_URL=http://host.docker.internal:14174/v1/internal/codex/nodes/physical-node",
+    `GENERATION_API_KEY=${bridgeToken}`,
+    "GENERATION_MODEL=gpt-5.6-terra",
+    `NODE_CODEX_BRIDGE_TOKEN=${bridgeToken}`,
+    "GENERATION_DIRECT_BASE_URL=",
+    "GENERATION_DIRECT_API_KEY=",
+    "GENERATION_DIRECT_MODEL=",
+    "CONTROL_DB_VOLUME=neuromem-node-control-db",
+    "MEMORY_DB_VOLUME=neuromem-node-memory-db",
+    "MEMORY_REDIS_VOLUME=neuromem-node-memory-redis",
+    "MCP_STATE_VOLUME=neuromem-node-mcp",
+    "DGX_MODEL_ENABLED=false",
+    "",
+  ].join("\n");
 }
 
 function escapeRegExp(value: string): string {

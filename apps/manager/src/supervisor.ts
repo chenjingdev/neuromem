@@ -11,6 +11,7 @@ export async function installSupervisor(
   runner: CommandRunner,
 ): Promise<{ installed: boolean; target?: string }> {
   if (process.env.NEUROMEM_NO_SUPERVISOR === "1") return { installed: false };
+  const executablePath = supervisorEnvironmentPath();
   if (process.platform === "darwin") {
     const directory = path.join(os.homedir(), "Library", "LaunchAgents");
     await ensurePrivateDirectory(directory);
@@ -23,7 +24,7 @@ export async function installSupervisor(
       `<key>ProgramArguments</key><array><string>${xml(process.execPath)}</string><string>${xml(daemonPath)}</string></array>`,
       '<key>RunAtLoad</key><true/>',
       '<key>KeepAlive</key><true/>',
-      `<key>EnvironmentVariables</key><dict><key>NEUROMEM_HOME</key><string>${xml(paths.home)}</string></dict>`,
+      `<key>EnvironmentVariables</key><dict><key>NEUROMEM_HOME</key><string>${xml(paths.home)}</string><key>PATH</key><string>${xml(executablePath)}</string></dict>`,
       `<key>StandardOutPath</key><string>${xml(paths.managerLog)}</string>`,
       `<key>StandardErrorPath</key><string>${xml(paths.managerLog)}</string>`,
       '</dict></plist>',
@@ -50,6 +51,7 @@ export async function installSupervisor(
       "[Service]",
       `ExecStart=${systemdEscape(process.execPath)} ${systemdEscape(daemonPath)}`,
       `Environment=NEUROMEM_HOME=${systemdEscape(paths.home)}`,
+      `Environment=PATH=${systemdEscape(executablePath)}`,
       "Restart=on-failure",
       "RestartSec=3",
       "",
@@ -63,6 +65,23 @@ export async function installSupervisor(
     return { installed: true, target };
   }
   return { installed: false };
+}
+
+export function supervisorEnvironmentPath(
+  inherited = process.env.PATH,
+  nodeExecutable = process.execPath,
+): string {
+  const entries = [
+    path.dirname(nodeExecutable),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    ...String(inherited || "").split(path.delimiter),
+  ].filter(Boolean);
+  return [...new Set(entries)].join(path.delimiter);
 }
 
 function xml(value: string): string {

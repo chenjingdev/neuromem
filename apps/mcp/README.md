@@ -1,25 +1,31 @@
 # `@neuromem/mcp`
 
-A dependency-free Node.js 20+ adapter for both local Core routing and credential-bound team memory.
+A dependency-free Node.js 20+ MCP adapter for the Neuromem Control Gateway. One
+deployed Node serves multiple credential-bound Workspaces and Projects.
 
-## Team mode
+## Control mode
 
-Team deployments point the adapter only at Control:
+The packaged Node runs the HTTP adapter in Control mode:
 
 ```text
 NEUROMEM_CONTROL_API_URL=http://control:8080
+NEUROMEM_MCP_AUTH_MODE=control
 NEUROMEM_MCP_ALLOW_REMOTE=true
 ```
 
 Each incoming bearer credential is resolved through `GET /api/v1/me`. The returned `AuthContext` pins `principal_id`, `credential_id`, Workspace, Project, Human Peer, optional Agent Peer, capabilities, and request ID to the MCP session. A credential cannot be swapped after `initialize`, and tool arguments cannot choose another scope or author. Every tool call is then sent to a documented `/api/v1` Control Gateway alias with that request's bearer; the adapter does not store the bearer in session state, on disk, or in logs.
 
-Team mode exposes recording, source/conclusion recall, Representation, Peer Card, Session Context, Wiki, Dynamic Context, Dialectic chat, Dream scheduling, explicitly granted federated search, and audited transfer requests. Recall defaults to `include_general=true` and `include_federated=false`. A record's `speaker` selects only between the credential-bound Human Peer and Agent Peer. Record-neighbor context, Claim evidence, and graph tools are intentionally absent until Control provides matching scoped aliases.
+Control mode exposes recording, source/conclusion recall, Representation, Peer Card, Session Context, Wiki, Dynamic Context, Dialectic chat, Dream scheduling, explicitly approved cross-Workspace search, and audited transfer requests. Recall defaults to `include_general=true` and `include_federated=false`. A record's `speaker` selects only between the credential-bound Human Peer and Agent Peer. Record-neighbor context, Claim evidence, and graph tools are intentionally absent until Control provides matching scoped aliases.
 
-`NEUROMEM_MCP_AUTH_CONTEXT` remains available only for legacy/hybrid development. HTTP team mode fails closed unless `NEUROMEM_CONTROL_API_URL` is configured.
+HTTP Control mode fails closed unless `NEUROMEM_CONTROL_API_URL` is configured.
 
-## Configuration
+## Development-only direct Router
 
-The Node-local direct mode is selected first when any direct variable is present. It requires all three values and fails closed when the Core token is absent:
+`legacy` and `hybrid` are retained only for Core integration development. They
+are not separate user platforms or deployment modes. `NEUROMEM_MCP_AUTH_CONTEXT`
+is likewise a development-only way to inject a fixed scope.
+
+The direct Router is selected when any direct variable is present. It requires all three values and fails closed when the Core token is absent:
 
 ```text
 NEUROMEM_NODE_ID=<node UUID>
@@ -27,24 +33,24 @@ NEUROMEM_CORE_URL=http://core:8000
 NEUROMEM_CORE_TOKEN=<Core bearer token>
 ```
 
-Router mode uses `NEUROMEM_NODES_JSON`, which accepts either a node array:
+Multi-node development uses `NEUROMEM_NODES_JSON`, which accepts either a node array:
 
 ```json
 [
-  { "id": "personal", "base_url": "http://127.0.0.1:18001", "token": "..." },
-  { "id": "company", "base_url": "http://127.0.0.1:28001", "token": "..." }
+  { "id": "node-a", "base_url": "http://127.0.0.1:18001", "token": "..." },
+  { "id": "node-b", "base_url": "http://127.0.0.1:28001", "token": "..." }
 ]
 ```
 
-or an object containing `nodes`, `default_read_targets`, `default_write_targets`, `state_dir`, `request_timeout_ms`, `rrf_k`, and `retry_interval_ms`. Every configured node requires a Core token of at least 32 bytes. The two-node shorthand uses `NEUROMEM_PERSONAL_URL`, `NEUROMEM_PERSONAL_TOKEN`, `NEUROMEM_COMPANY_URL`, and `NEUROMEM_COMPANY_TOKEN`.
+or an object containing `nodes`, `default_read_targets`, `default_write_targets`, `state_dir`, `request_timeout_ms`, `core_max_response_bytes`, `rrf_k`, and `retry_interval_ms`. Every configured node requires a Core token of at least 32 bytes.
 
 Each Router node may define `scope_map`, keyed by the caller's logical `project_id`, with a node-local `{ "workspace_id", "project_id" }`. Writes and reads translate per node while results retain both `logical_scope` and `origin_scope`. Missing mappings keep the caller IDs unchanged.
 
 Core requests time out after 120 seconds and responses are capped at 64 MiB by default. Override these with `NEUROMEM_REQUEST_TIMEOUT_MS` and `NEUROMEM_CORE_MAX_RESPONSE_BYTES`.
 
-Defaults intentionally select only `personal` when it exists, otherwise the first configured node. Set `target` to `personal`, `company`, or `both`, or configure defaults at the Router.
+Read and write defaults select the first configured node unless explicitly configured. A tool's optional `target` accepts any configured Node ID or `all`.
 
-## Local tool and REST contract
+## Development Router tool and REST contract
 
 | Tool | Core REST call |
 |---|---|
@@ -71,9 +77,9 @@ Recall responses preserve Core `embedding_used` and top-level `record_snippets`.
 
 ```sh
 npm run build
-neuromem-mcp
+npm start
 ```
 
-`npm start` runs Streamable HTTP on `HOST` (code default `127.0.0.1`; the container explicitly sets `0.0.0.0`) and `PORT` (default `3001`). `/mcp` requires `Authorization: Bearer $NEUROMEM_MCP_TOKEN` with a token of at least 16 bytes, creates an `Mcp-Session-Id` during `initialize`, and accepts `tools/list`, `tools/call`, `ping`, initialized notifications, deletion, and post-initialization JSON-RPC batches of at most 32 items. Notification-only batches return HTTP 202 without a body. Host and browser Origin checks permit loopback only. `/health` is a body-free liveness endpoint. Incoming JSON is capped at 5 MiB by default (`NEUROMEM_MCP_MAX_BODY_BYTES`).
+`npm start` runs Streamable HTTP on `HOST` (code default `127.0.0.1`; the container explicitly sets `0.0.0.0`) and `PORT` (default `3001`). In Control mode, `/mcp` accepts a Control-issued bearer and resolves its scope server-side. Development Router HTTP instead requires `Authorization: Bearer $NEUROMEM_MCP_TOKEN` with a token of at least 16 bytes. The endpoint creates an `Mcp-Session-Id` during `initialize` and accepts `tools/list`, `tools/call`, `ping`, initialized notifications, deletion, and post-initialization JSON-RPC batches of at most 32 items. Notification-only batches return HTTP 202 without a body. Host and browser Origin checks permit loopback only. `/health` is a body-free liveness endpoint. Incoming JSON is capped at 5 MiB by default (`NEUROMEM_MCP_MAX_BODY_BYTES`).
 
-`neuromem-mcp` remains the stdio executable for newline-delimited JSON-RPC 2.0. `neuromem-mcp-http` starts the HTTP transport.
+`neuromem-mcp-http` starts the HTTP transport. `neuromem-mcp` is the development Router's stdio executable for newline-delimited JSON-RPC 2.0.

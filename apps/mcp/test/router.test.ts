@@ -13,8 +13,8 @@ import {
   FederatedMemoryRouter,
   loadRouterConfig,
   MEMORY_TOOLS,
-  TEAM_MEMORY_TOOLS,
-  TeamGatewayClient,
+  CONTROL_MEMORY_TOOLS,
+  ControlGatewayClient,
   MemoryToolDispatcher,
   type AuthContext,
   type FederatedResult,
@@ -30,7 +30,7 @@ const CLAIM_ID = "018f0f86-4d69-7a3c-8f2c-123456789abc";
 const LOGICAL_SCOPE = { workspace_id: WORKSPACE_ID, project_id: PROJECT_ID };
 const HUMAN_PEER_ID = "018f0f86-4d71-7a3c-8f2c-123456789abc";
 const AGENT_PEER_ID = "018f0f86-4d72-7a3c-8f2c-123456789abc";
-const TEAM_AUTH: AuthContext = {
+const CONTROL_AUTH: AuthContext = {
   principal_id: "018f0f86-4d73-7a3c-8f2c-123456789abc",
   credential_id: "018f0f86-4d74-7a3c-8f2c-123456789abc",
   workspace_id: WORKSPACE_ID,
@@ -128,7 +128,7 @@ test("the dispatcher exposes exactly the eight final memory tools", () => {
   }));
 });
 
-test("team mode derives scope and author Peers and uses only Control Gateway aliases", async (context) => {
+test("control mode derives scope and author Peers and uses only Control Gateway aliases", async (context) => {
   const node = await mockNode((request) => {
     if (request.path.includes("/memory/projects/")) return { body: { ok: true } };
     if (request.path.includes("/memory/sessions/") && request.path.endsWith("/messages")) return { status: 201, body: { records: [] } };
@@ -142,11 +142,11 @@ test("team mode derives scope and author Peers and uses only Control Gateway ali
     return { status: 404 };
   });
   context.after(async () => { await node.close(); });
-  const gateway = new TeamGatewayClient(node.baseUrl);
-  const dispatcher = new MemoryToolDispatcher(undefined, { authMode: "team" })
-    .withTeamRequest(TEAM_AUTH, gateway, "incoming-credential-secret");
+  const gateway = new ControlGatewayClient(node.baseUrl);
+  const dispatcher = new MemoryToolDispatcher(undefined, { authMode: "control" })
+    .withControlRequest(CONTROL_AUTH, gateway, "incoming-credential-secret");
 
-  assert.equal(TEAM_MEMORY_TOOLS.length, 16);
+  assert.equal(CONTROL_MEMORY_TOOLS.length, 16);
   const recordSchema = dispatcher.listTools().find((tool) => tool.name === "memory_record")!.inputSchema;
   assert.equal("workspace_id" in (recordSchema.properties as JsonObject), false);
   assert.equal("author_key" in (recordSchema.properties as JsonObject), false);
@@ -192,8 +192,8 @@ test("team mode derives scope and author Peers and uses only Control Gateway ali
     workspace_id: "018f0f86-4d75-7a3c-8f2c-123456789abc",
     session_id: SESSION_ID, speaker: "agent", content: "spoof"
   }), /unknown argument 'workspace_id'/);
-  await assert.rejects(new MemoryToolDispatcher(undefined, { authMode: "team" })
-    .withTeamRequest({ ...TEAM_AUTH, capabilities: ["project.read"] }, gateway, "read-only-secret")
+  await assert.rejects(new MemoryToolDispatcher(undefined, { authMode: "control" })
+    .withControlRequest({ ...CONTROL_AUTH, capabilities: ["project.read"] }, gateway, "read-only-secret")
     .callTool("memory_record", { session_id: SESSION_ID, speaker: "agent", content: "forbidden" }), /lacks 'project.write'/);
 });
 
@@ -232,7 +232,7 @@ test("memory_record sends the exact batch shape with one UUIDv7 across nodes", a
     content,
     source_app: "codex",
     metadata: { channel: "test" },
-    target: "both"
+    target: "all"
   }) as { record_id: string; deliveries: Record<string, { status: string }> };
 
   assert.match(result.record_id, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
@@ -505,7 +505,7 @@ test("recall runs selected nodes in parallel, dedupes, and applies reciprocal-ra
 
   const started = Date.now();
   const result = await dispatcher.callTool("search_records", {
-    ...scope(), query: "shared", target: "both", limit: 10
+    ...scope(), query: "shared", target: "all", limit: 10
   }) as FederatedResult;
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 260, `parallel query took ${elapsed}ms`);
@@ -528,7 +528,7 @@ test("recall runs selected nodes in parallel, dedupes, and applies reciprocal-ra
   const topSnippetRefs = new Set(result.record_snippets?.map((snippet) => snippet.snippet_ref));
   assert.ok(topSnippetRefs.has((result.results[0]?.record_snippet as JsonObject | undefined)?.snippet_ref));
   const claimResult = await dispatcher.callTool("search_claims", {
-    ...scope(), query: "shared", target: "both", limit: 10
+    ...scope(), query: "shared", target: "all", limit: 10
   }) as { results: JsonObject[] };
   assert.equal(claimResult.results.length, 3);
   assert.deepEqual(claimResult.results.map((item) => item.origin_nodes), [
@@ -615,42 +615,42 @@ test("dispatcher rejects missing scope and undeclared arguments", async (context
   await assert.rejects(dispatcher.callTool("wiki_read", { ...scope(), surprise: true }), /unknown argument/);
 });
 
-test("environment config supports router objects and safe personal defaults", () => {
+test("environment config defaults to the first configured node", () => {
   const config = loadRouterConfig({
     NEUROMEM_NODES_JSON: JSON.stringify({
       nodes: [
-        { id: "personal", base_url: "http://127.0.0.1:18001", token: "personal-core-token-0123456789abcdef" },
-        { id: "company", base_url: "http://127.0.0.1:28001", token: "company-core-token-0123456789abcdef" }
+        { id: "node-a", base_url: "http://127.0.0.1:18001", token: "node-a-core-token-0123456789abcdef" },
+        { id: "node-b", base_url: "http://127.0.0.1:28001", token: "node-b-core-token-0123456789abcdef" }
       ],
       state_dir: "/tmp/mcp-state"
     })
   });
-  assert.deepEqual(config.defaultReadTargets, ["personal"]);
-  assert.deepEqual(config.defaultWriteTargets, ["personal"]);
+  assert.deepEqual(config.defaultReadTargets, ["node-a"]);
+  assert.deepEqual(config.defaultWriteTargets, ["node-a"]);
   assert.equal(config.stateDir, "/tmp/mcp-state");
-  assert.equal(config.nodes[1]?.id, "company");
+  assert.equal(config.nodes[1]?.id, "node-b");
 });
 
-test("direct mode is preferred, token-required, and public targets fail closed", async (context) => {
+test("direct mode is preferred, token-required, and unknown targets fail closed", async (context) => {
   const direct = loadRouterConfig({
     NEUROMEM_NODE_ID: "018f0f86-4d70-7a3c-8f2c-123456789abc",
-    NEUROMEM_NODE_ALIAS: "personal",
+    NEUROMEM_NODE_ALIAS: "node-a",
     NEUROMEM_CORE_URL: "http://core:8000",
     NEUROMEM_CORE_TOKEN: "core-token-0123456789abcdefghijklmn",
-    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "personal", base_url: "http://ignored", token: "ignored" }]),
+    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "node-a", base_url: "http://ignored", token: "ignored" }]),
     NEUROMEM_MCP_STATE_DIR: "/tmp/direct-mcp-state"
   });
   assert.deepEqual(direct.nodes, [{
-    id: "personal", baseUrl: "http://core:8000", token: "core-token-0123456789abcdefghijklmn"
+    id: "node-a", baseUrl: "http://core:8000", token: "core-token-0123456789abcdefghijklmn"
   }]);
   assert.throws(() => loadRouterConfig({
     NEUROMEM_NODE_ID: "node-1", NEUROMEM_CORE_URL: "http://core:8000"
   }), /requires NEUROMEM_NODE_ID/);
   assert.throws(() => loadRouterConfig({
-    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "personal", base_url: "http://127.0.0.1:18001" }])
+    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "node-a", base_url: "http://127.0.0.1:18001" }])
   }), /requires a Core token/);
   assert.throws(() => loadRouterConfig({
-    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "personal", base_url: "http://127.0.0.1:18001", token: "too-short" }])
+    NEUROMEM_NODES_JSON: JSON.stringify([{ id: "node-a", base_url: "http://127.0.0.1:18001", token: "too-short" }])
   }), /at least 32 bytes/);
 
   const stateDir = await mkdtemp(join(tmpdir(), "neuromem-mcp-test-"));
@@ -660,27 +660,27 @@ test("direct mode is preferred, token-required, and public targets fail closed",
     await rm(stateDir, { recursive: true, force: true });
   });
   const dispatcher = new MemoryToolDispatcher(new FederatedMemoryRouter({
-    nodes: [{ id: "personal", baseUrl: node.baseUrl, token: "core-token-0123456789abcdefghijklmn" }], stateDir
+    nodes: [{ id: "node-a", baseUrl: node.baseUrl, token: "core-token-0123456789abcdefghijklmn" }], stateDir
   }));
-  await assert.rejects(dispatcher.callTool("wiki_read", { ...scope(), target: "company" }), /unavailable/);
-  await assert.rejects(dispatcher.callTool("wiki_read", { ...scope(), target: "both" }), /missing node 'company'/);
-  const result = await dispatcher.callTool("wiki_read", { ...scope(), target: "personal" }) as { results: JsonObject[] };
-  assert.equal(result.results[0]?.origin_node, "personal");
+  await assert.rejects(dispatcher.callTool("wiki_read", { ...scope(), target: "node-b" }), /unavailable/);
+  const result = await dispatcher.callTool("wiki_read", { ...scope(), target: "all" }) as { results: JsonObject[] };
+  assert.equal(result.results[0]?.origin_node, "node-a");
   const directRouter = new FederatedMemoryRouter({ ...direct, stateDir: join(stateDir, "direct") });
   await directRouter.retryPending({ force: false });
-  assert.deepEqual(directRouter.targetsFor("personal"), ["personal"]);
+  assert.deepEqual(directRouter.targetsFor("node-a"), ["node-a"]);
+  assert.deepEqual(directRouter.targetsFor("all"), ["node-a"]);
   await directRouter.close();
 
-  const companyDirect = loadRouterConfig({
+  const secondDirect = loadRouterConfig({
     NEUROMEM_NODE_ID: "018f0f86-4d70-7a3c-8f2c-123456789abd",
-    NEUROMEM_NODE_ALIAS: "company",
+    NEUROMEM_NODE_ALIAS: "node-b",
     NEUROMEM_CORE_URL: "http://core:8000",
     NEUROMEM_CORE_TOKEN: "core-token-0123456789abcdefghijklmn",
   });
-  const companyRouter = new FederatedMemoryRouter({ ...companyDirect, stateDir: join(stateDir, "company-direct") });
-  assert.deepEqual(companyRouter.targetsFor("company"), ["company"]);
-  assert.throws(() => companyRouter.targetsFor("personal"), /unavailable/);
-  await companyRouter.close();
+  const secondRouter = new FederatedMemoryRouter({ ...secondDirect, stateDir: join(stateDir, "node-b-direct") });
+  assert.deepEqual(secondRouter.targetsFor("node-b"), ["node-b"]);
+  assert.throws(() => secondRouter.targetsFor("node-a"), /unavailable/);
+  await secondRouter.close();
 });
 
 test("scope maps translate every fanout request and preserve logical provenance", async (context) => {
@@ -725,7 +725,7 @@ test("scope maps translate every fanout request and preserve logical provenance"
   }));
   const written = await dispatcher.callTool("memory_record", {
     ...scope(), session_id: SESSION_ID, author_key: "agent-codex", author_kind: "agent",
-    content: "Mapped CASE-sensitive payload", target: "both"
+    content: "Mapped CASE-sensitive payload", target: "all"
   }) as { deliveries: Record<string, JsonObject> };
   assert.deepEqual(written.deliveries.personal?.origin_scope, { workspace_id: personalWorkspace, project_id: personalProject });
   assert.deepEqual(written.deliveries.company?.origin_scope, { workspace_id: companyWorkspace, project_id: companyProject });
@@ -740,14 +740,14 @@ test("scope maps translate every fanout request and preserve logical provenance"
   );
 
   const recalled = await dispatcher.callTool("search_records", {
-    ...scope(), query: "Mapped", target: "both"
+    ...scope(), query: "Mapped", target: "all"
   }) as FederatedResult;
   assert.deepEqual(personal.requests[1]?.body?.workspace_id, personalWorkspace);
   assert.deepEqual(company.requests[1]?.body?.project_id, companyProject);
   assert.deepEqual(recalled.results[0]?.logical_scope, LOGICAL_SCOPE);
   assert.deepEqual(recalled.results[0]?.origin_scope, { workspace_id: personalWorkspace, project_id: personalProject });
 
-  const wiki = await dispatcher.callTool("wiki_read", { ...scope(), target: "both" }) as FederatedResult;
+  const wiki = await dispatcher.callTool("wiki_read", { ...scope(), target: "all" }) as FederatedResult;
   assert.match(personal.requests[2]?.path ?? "", new RegExp(`/projects/${personalProject}/wiki`));
   assert.match(company.requests[2]?.path ?? "", new RegExp(`/projects/${companyProject}/wiki`));
   assert.deepEqual(wiki.results.map((item) => item.origin_scope), [

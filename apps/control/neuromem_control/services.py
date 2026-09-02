@@ -28,6 +28,7 @@ from .models import (
     Workspace,
     WorkspaceLink,
     WorkspaceMembership,
+    WorkspaceShare,
     new_id,
     utcnow,
 )
@@ -155,9 +156,8 @@ def create_workspace_bundle(
     principal: Principal,
     slug: str,
     name: str,
-    kind: str,
 ) -> tuple[Workspace, Project, Peer, WorkspaceMembership]:
-    workspace = Workspace(slug=slug, name=name, kind=kind)
+    workspace = Workspace(slug=slug, name=name)
     db.add(workspace)
     db.flush()
     membership = WorkspaceMembership(
@@ -240,7 +240,12 @@ def bootstrap(
         select(func.count()).select_from(Principal)
     ):
         fail(409, "bootstrap has already been completed")
-    db.add(SystemState(key="bootstrap", value={"request_id": request_id}))
+    db.add(
+        SystemState(
+            key="bootstrap",
+            value={"request_id": request_id, "node_id": settings.node_id},
+        )
+    )
     db.flush()
     principal = Principal(
         email=email.lower(),
@@ -254,7 +259,6 @@ def bootstrap(
         principal=principal,
         slug=workspace_slug,
         name=workspace_name,
-        kind="personal",
     )
     credential, raw_credential = issue_credential(
         db,
@@ -326,6 +330,22 @@ def require_admin_membership(
     )
     if membership is None:
         fail(403, "workspace owner or admin required")
+    return membership
+
+
+def require_owner_membership(
+    db: Session, principal_id: str, workspace_id: str
+) -> WorkspaceMembership:
+    membership = db.scalar(
+        select(WorkspaceMembership).where(
+            WorkspaceMembership.workspace_id == workspace_id,
+            WorkspaceMembership.principal_id == principal_id,
+            WorkspaceMembership.status == "active",
+            WorkspaceMembership.role == "owner",
+        )
+    )
+    if membership is None:
+        fail(403, "workspace owner required")
     return membership
 
 
@@ -654,6 +674,150 @@ def transfer_agent_owner(
     )
     db.commit()
     return ownership
+
+
+def workspace_share_projects(db: Session, share: WorkspaceShare) -> list[Project]:
+    query = select(Project).where(
+        Project.workspace_id == share.owner_workspace_id,
+        Project.status == "active",
+    )
+    if share.display_mode == "projects":
+        query = query.where(Project.id.in_(share.project_ids))
+    return list(
+        db.scalars(query.order_by(Project.is_general.desc(), Project.name, Project.id))
+    )
+
+
+def create_workspace_share(
+    db: Session,
+    auth: Authenticated,
+    *,
+    recipient_workspace_id: str,
+    display_mode: str,
+    project_ids: list[str],
+) -> WorkspaceShare:
+    owner_workspace_id = auth.context.workspace_id
+    if owner_workspace_id is None:
+        fail(400, "workspace context required")
+    require_capability(auth, "federation.manage")
+    require_owner_membership(db, auth.principal.id, owner_workspace_id)
+    if owner_workspace_id == recipient_workspace_id:
+        fail(400, "share workspaces must be distinct")
+    recipient = db.get(Workspace, recipient_workspace_id)
+    if recipient is None or recipient.status != "active":
+        fail(404, "recipient workspace not found")
+    if display_mode == "projects":
+        projects = validate_projects(db, owner_workspace_id, project_ids)
+        selected_project_ids = sorted(project.id for project in projects)
+    else:
+        selected_project_ids = []
+    live = db.scalar(
+        select(WorkspaceShare).where(
+            WorkspaceShare.owner_workspace_id == owner_workspace_id,
+            WorkspaceShare.recipient_workspace_id == recipient_workspace_id,
+            WorkspaceShare.status.in_(["proposed", "active"]),
+        )
+    )
+    if live is not None:
+        fail(409, "a live share already exists for these workspaces")
+    now = utcnow()
+    share = WorkspaceShare(
+        owner_workspace_id=owner_workspace_id,
+        recipient_workspace_id=recipient_workspace_id,
+        display_mode=display_mode,
+        project_ids=selected_project_ids,
+        proposed_by_principal_id=auth.principal.id,
+        owner_approved_by_principal_id=auth.principal.id,
+        owner_approved_at=now,
+    )
+    db.add(share)
+    db.flush()
+    audit_auth(
+        db,
+        auth,
+        "workspace_share.proposed",
+        "workspace_share",
+        share.id,
+        workspace_id=owner_workspace_id,
+        details={
+            "recipient_workspace_id": recipient_workspace_id,
+            "display_mode": display_mode,
+            "project_ids": selected_project_ids,
+        },
+    )
+    db.commit()
+    return share
+
+
+def approve_workspace_share(
+    db: Session, auth: Authenticated, share: WorkspaceShare
+) -> WorkspaceShare:
+    if share.status != "proposed":
+        fail(409, "workspace share is not proposed")
+    if auth.context.workspace_id != share.recipient_workspace_id:
+        fail(403, "recipient workspace owner required")
+    require_owner_membership(db, auth.principal.id, share.recipient_workspace_id)
+    share.recipient_approved_by_principal_id = auth.principal.id
+    share.recipient_approved_at = utcnow()
+    share.status = "active"
+    audit_auth(
+        db,
+        auth,
+        "workspace_share.approved",
+        "workspace_share",
+        share.id,
+        workspace_id=share.recipient_workspace_id,
+    )
+    db.commit()
+    return share
+
+
+def reject_workspace_share(
+    db: Session, auth: Authenticated, share: WorkspaceShare
+) -> WorkspaceShare:
+    if share.status != "proposed":
+        fail(409, "workspace share is not proposed")
+    if auth.context.workspace_id != share.recipient_workspace_id:
+        fail(403, "recipient workspace owner required")
+    require_owner_membership(db, auth.principal.id, share.recipient_workspace_id)
+    share.status = "rejected"
+    share.rejected_at = utcnow()
+    audit_auth(
+        db,
+        auth,
+        "workspace_share.rejected",
+        "workspace_share",
+        share.id,
+        workspace_id=share.recipient_workspace_id,
+    )
+    db.commit()
+    return share
+
+
+def revoke_workspace_share(
+    db: Session, auth: Authenticated, share: WorkspaceShare
+) -> WorkspaceShare:
+    if share.status not in {"proposed", "active"}:
+        fail(409, "workspace share is not live")
+    selected = auth.context.workspace_id
+    if selected not in {
+        share.owner_workspace_id,
+        share.recipient_workspace_id,
+    }:
+        fail(403, "shared workspace owner required")
+    require_owner_membership(db, auth.principal.id, selected)
+    share.status = "revoked"
+    share.revoked_at = utcnow()
+    audit_auth(
+        db,
+        auth,
+        "workspace_share.revoked",
+        "workspace_share",
+        share.id,
+        workspace_id=selected,
+    )
+    db.commit()
+    return share
 
 
 def create_workspace_link(

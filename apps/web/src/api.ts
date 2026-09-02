@@ -19,14 +19,16 @@ import type {
   RecordContext,
   Scope,
   CreatedCredential,
-  FederatedProjectGrant,
   PeerBinding,
+  ProjectFolderBinding,
   ProjectGrant,
-  TeamDashboard,
   TransferRequest,
-  WorkspaceLink,
+  WorkspaceDashboard,
   WorkspaceMember,
   WorkspaceRole,
+  WorkspaceProjection,
+  WorkspaceShare,
+  WorkspaceShareProposal,
   WikiDocument,
   ProjectOption,
   WorkspaceOption,
@@ -42,7 +44,7 @@ export class ApiError extends Error {
   }
 }
 
-const teamBase = trimBase(import.meta.env.VITE_TEAM_API_URL || "/api");
+const productBase = trimBase(import.meta.env.VITE_PRODUCT_API_URL || "/api");
 let managerBase = trimBase(import.meta.env.VITE_MANAGER_API_URL || "http://127.0.0.1:14174");
 
 function trimBase(value: string) {
@@ -81,7 +83,7 @@ async function request<T>(base: string, path: string, init: RequestInit & { mana
 const json = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });
 const patchJson = (body: unknown): RequestInit => ({ method: "PATCH", body: JSON.stringify(body) });
 const deleteRequest = (): RequestInit => ({ method: "DELETE" });
-const teamHeaders = (workspaceId: string, projectId?: string): Record<string, string> => ({
+const workspaceHeaders = (workspaceId: string, projectId?: string): Record<string, string> => ({
   "x-neuromem-workspace": workspaceId,
   ...(projectId ? { "x-neuromem-project": projectId } : {}),
 });
@@ -211,7 +213,7 @@ interface RawMigrationPlan {
 }
 
 function productRequest<T>(path: string, init: RequestInit = {}) {
-  return request<T>(teamBase, path, { ...init, credentials: "include" });
+  return request<T>(productBase, path, { ...init, credentials: "include" });
 }
 
 function slugify(value: string, fallback = "project") {
@@ -219,7 +221,7 @@ function slugify(value: string, fallback = "project") {
   return normalized.length >= 3 ? normalized.slice(0, 128) : `${fallback}-${Date.now().toString(36)}`;
 }
 
-/** Team product memory APIs. Every call enters through Control; the browser
+/** Product memory APIs. Every call enters through Control; the browser
  * never talks to Memory Core or carries a Core token. */
 export const coreApi = {
   workspaces: async () => {
@@ -228,15 +230,15 @@ export const coreApi = {
     return Promise.all(workspaces.map(async workspace => {
       const projects = await productRequest<{ items?: WorkspaceOption["projects"]; projects?: WorkspaceOption["projects"] } | NonNullable<WorkspaceOption["projects"]>>(
         `/v1/workspaces/${encodeURIComponent(workspace.id)}/projects`,
-        { headers: teamHeaders(workspace.id) },
+        { headers: workspaceHeaders(workspace.id) },
       );
       return { ...workspace, projects: Array.isArray(projects) ? projects : projects.items || projects.projects || [] };
     }));
   },
-  createWorkspace: (name: string) => productRequest<WorkspaceOption>("/v1/workspaces", json({ slug: slugify(name, "workspace"), name, kind: "company" })),
+  createWorkspace: (name: string) => productRequest<WorkspaceOption>("/v1/workspaces", json({ slug: slugify(name, "workspace"), name })),
   createProject: (workspaceId: string, name: string) => productRequest<{ id: string; name: string }>(
     `/v1/workspaces/${encodeURIComponent(workspaceId)}/projects`,
-    { ...json({ slug: slugify(name), name, access_policy: "inherited" }), headers: teamHeaders(workspaceId) },
+    { ...json({ slug: slugify(name), name, access_policy: "inherited" }), headers: workspaceHeaders(workspaceId) },
   ),
   overview: async (scope: Scope): Promise<Overview> => {
     const claims = await coreApi.claims(scope);
@@ -257,19 +259,19 @@ export const coreApi = {
     include: ["records", "claims"],
     include_general: true,
     include_federated: false,
-  }), headers: teamHeaders(scope.workspaceId, scope.projectId) })),
+  }), headers: workspaceHeaders(scope.workspaceId, scope.projectId) })),
   claims: async (scope: Scope) => {
     const payload = await productRequest<{ items: Array<RawClaim | { claim: RawClaim }> }>("/v1/memory/conclusions", {
-      ...json({ query: null, limit: 100, include_general: true }), headers: teamHeaders(scope.workspaceId, scope.projectId),
+      ...json({ query: null, limit: 100, include_general: true }), headers: workspaceHeaders(scope.workspaceId, scope.projectId),
     });
     return { items: payload.items.map(item => normalizeClaim("claim" in item ? item.claim : item)) };
   },
   wiki: async (scope: Scope) => normalizeWiki(await productRequest<RawWiki>(`/v1/projects/${encodeURIComponent(scope.projectId)}/wiki`, {
-    headers: teamHeaders(scope.workspaceId, scope.projectId),
+    headers: workspaceHeaders(scope.workspaceId, scope.projectId),
   }), scope),
-  claimEvidence: async (_scope: Scope, _claimId: string): Promise<ClaimEvidence> => { throw new ApiError("팀 모드에서는 Claim evidence 상세를 아직 제공하지 않습니다.", 501); },
-  graph: async (_scope: Scope): Promise<KnowledgeGraph> => { throw new ApiError("팀 모드에서는 Graph를 아직 제공하지 않습니다.", 501); },
-  recordContext: async (_scope: Scope, _recordId: string): Promise<RecordContext> => { throw new ApiError("팀 모드에서는 record context를 아직 제공하지 않습니다.", 501); },
+  claimEvidence: async (_scope: Scope, _claimId: string): Promise<ClaimEvidence> => { throw new ApiError("Claim evidence 상세를 아직 제공하지 않습니다.", 501); },
+  graph: async (_scope: Scope): Promise<KnowledgeGraph> => { throw new ApiError("Graph를 아직 제공하지 않습니다.", 501); },
+  recordContext: async (_scope: Scope, _recordId: string): Promise<RecordContext> => { throw new ApiError("record context를 아직 제공하지 않습니다.", 501); },
 };
 
 export interface ProductAuthEnvelope {
@@ -285,6 +287,10 @@ export interface ProductOnboardingResult extends ProductAuthEnvelope {
 
 export const authApi = {
   me: () => productRequest<ProductAuthEnvelope>("/v1/me"),
+  localTestLoginPrefill: async () => {
+    try { return await productRequest<{ email: string; password: string }>("/v1/auth/local-test-prefill"); }
+    catch (error) { if (error instanceof ApiError && error.status === 404) return null; throw error; }
+  },
   login: (email: string, password: string) => productRequest<ProductAuthEnvelope>("/v1/auth/login", json({ email, password })),
   bootstrap: (input: { email: string; display_name: string; password: string; workspace_name: string }) => productRequest<ProductOnboardingResult>("/v1/auth/bootstrap", json({
     ...input, workspace_slug: slugify(input.workspace_name, "workspace"),
@@ -364,29 +370,29 @@ function normalizeTransfer(raw: RawTransfer): TransferRequest {
 
 /** Workspace product APIs. These always use the browser's product session;
  * host/node administration remains isolated in managerApi. */
-export const teamApi = {
+export const workspaceApi = {
   members: async (workspaceId: string) => listItems(await request<{ items?: RawMembership[] } | RawMembership[]>(
-    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members`, { credentials: "include", headers: teamHeaders(workspaceId) },
+    productBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members`, { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )).map((member): WorkspaceMember => ({
     ...member, display_name: member.principal_id, human_peer_id: "", human_peer_status: member.status,
     agent_peers: [],
   })),
   inviteMember: async (workspaceId: string, input: { email: string; role: WorkspaceRole }) => {
     const result = await request<{ invitation: { id: string; expires_at: string }; token: string }>(
-      teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/invitations`, { ...json(input), credentials: "include", headers: teamHeaders(workspaceId) },
+      productBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/invitations`, { ...json(input), credentials: "include", headers: workspaceHeaders(workspaceId) },
     );
     const invite = new URL("/app/invite", window.location.origin);
     invite.searchParams.set("token", result.token);
     return { invitation_id: result.invitation.id, invite_url: invite.toString(), expires_at: result.invitation.expires_at };
   },
   updateMember: (workspaceId: string, memberId: string, input: { role?: WorkspaceRole; status?: "active" | "inactive" }) => request<RawMembership>(
-    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`, { ...patchJson(input), credentials: "include", headers: teamHeaders(workspaceId) },
+    productBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`, { ...patchJson(input), credentials: "include", headers: workspaceHeaders(workspaceId) },
   ),
   peerBindings: async (workspaceId: string): Promise<PeerBinding[]> => normalizePeerBindings(listItems(await request<{ items?: RawPeerBinding[] } | RawPeerBinding[]>(
-    teamBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/peer-bindings`, { credentials: "include", headers: teamHeaders(workspaceId) },
+    productBase, `/v1/workspaces/${encodeURIComponent(workspaceId)}/peer-bindings`, { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )), workspaceId),
   credentials: async (workspaceId: string) => listItems(await request<{ items?: RawCredential[] } | RawCredential[]>(
-    teamBase, "/v1/credentials", { credentials: "include", headers: teamHeaders(workspaceId) },
+    productBase, "/v1/credentials", { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )).map(normalizeCredential),
   createCredential: (input: {
     workspace_id: string;
@@ -395,57 +401,67 @@ export const teamApi = {
     client: "codex" | "claude" | "custom";
     agent_peer_id?: string;
     capabilities: string[];
-  }) => request<{ credential: RawCredential; token: string }>(teamBase, "/v1/credentials", {
+  }) => request<{ credential: RawCredential; token: string }>(productBase, "/v1/credentials", {
     ...json({ name: input.name, kind: "mcp", agent_peer_id: input.agent_peer_id, capabilities: input.capabilities, project_ids: input.project_id ? [input.project_id] : [] }),
-    credentials: "include", headers: teamHeaders(input.workspace_id, input.project_id),
+    credentials: "include", headers: workspaceHeaders(input.workspace_id, input.project_id),
   }).then((result): CreatedCredential => ({ credential: normalizeCredential(result.credential), secret: result.token })),
   revokeCredential: (scope: Scope, credentialId: string) => request<void>(
-    teamBase, `/v1/credentials/${encodeURIComponent(credentialId)}`, { ...deleteRequest(), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+    productBase, `/v1/credentials/${encodeURIComponent(credentialId)}`, { ...deleteRequest(), credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
   ),
   projectGrants: async (scope: Scope) => listItems(await request<{ items?: ProjectGrant[] } | ProjectGrant[]>(
-    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
   )),
   createProjectGrant: (scope: Scope, input: { principal_id: string; capabilities: string[] }) => request<ProjectGrant>(
-    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { ...json(input), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants`, { ...json(input), credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
   ),
   revokeProjectGrant: (scope: Scope, grantId: string) => request<void>(
-    teamBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants/${encodeURIComponent(grantId)}`, { ...deleteRequest(), credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId) },
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/grants/${encodeURIComponent(grantId)}`, { ...deleteRequest(), credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
   ),
-  workspaceLinks: async (workspaceId: string) => listItems(await request<{ items?: WorkspaceLink[] } | WorkspaceLink[]>(
-    teamBase, "/v1/workspace-links", { credentials: "include", headers: teamHeaders(workspaceId) },
+  getProjectFolder: (scope: Scope) => request<ProjectFolderBinding | null>(
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/local-folder`, { credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  pickProjectFolder: (scope: Scope) => request<ProjectFolderBinding | null>(
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/local-folder:pick`, { ...json({}), credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  disconnectProjectFolder: (scope: Scope) => request<void>(
+    productBase, `/v1/projects/${encodeURIComponent(scope.projectId)}/local-folder`, { ...deleteRequest(), credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId) },
+  ),
+  shares: async (workspaceId: string) => listItems(await request<{ items?: WorkspaceShare[] } | WorkspaceShare[]>(
+    productBase, "/v1/workspace-shares", { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )),
-  createWorkspaceLink: (input: { source_workspace_id: string; target_workspace_id: string }) => request<WorkspaceLink>(
-    teamBase, "/v1/workspace-links", { ...json(input), credentials: "include", headers: teamHeaders(input.source_workspace_id) },
-  ),
-  approveWorkspaceLink: (workspaceId: string, linkId: string) => request<WorkspaceLink>(
-    teamBase, `/v1/workspace-links/${encodeURIComponent(linkId)}:approve`, { ...json({}), credentials: "include", headers: teamHeaders(workspaceId) },
-  ),
-  federatedGrants: async (workspaceId: string) => listItems(await request<{ items?: FederatedProjectGrant[] } | FederatedProjectGrant[]>(
-    teamBase, "/v1/federated-project-grants", { credentials: "include", headers: teamHeaders(workspaceId) },
+  projections: async (workspaceId: string) => listItems(await request<{ items?: WorkspaceProjection[] } | WorkspaceProjection[]>(
+    productBase, "/v1/workspace-projections", { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )),
-  createFederatedGrant: (workspaceId: string, input: {
-    workspace_link_id: string;
-    source_project_id: string;
-    capabilities: Array<"search" | "read_source">;
-  }) => request<FederatedProjectGrant>(teamBase, "/v1/federated-project-grants", { ...json(input), credentials: "include", headers: teamHeaders(workspaceId) }),
+  proposeShare: (workspaceId: string, input: WorkspaceShareProposal) => request<WorkspaceShare>(
+    productBase, "/v1/workspace-shares", { ...json(input), credentials: "include", headers: workspaceHeaders(workspaceId) },
+  ),
+  approveShare: (workspaceId: string, shareId: string) => request<WorkspaceShare>(
+    productBase, `/v1/workspace-shares/${encodeURIComponent(shareId)}:approve`, { ...json({}), credentials: "include", headers: workspaceHeaders(workspaceId) },
+  ),
+  rejectShare: (workspaceId: string, shareId: string) => request<WorkspaceShare>(
+    productBase, `/v1/workspace-shares/${encodeURIComponent(shareId)}:reject`, { ...json({}), credentials: "include", headers: workspaceHeaders(workspaceId) },
+  ),
+  revokeShare: (workspaceId: string, shareId: string) => request<WorkspaceShare>(
+    productBase, `/v1/workspace-shares/${encodeURIComponent(shareId)}:revoke`, { ...json({}), credentials: "include", headers: workspaceHeaders(workspaceId) },
+  ),
   transferRequests: async (workspaceId: string) => listItems(await request<{ items?: RawTransfer[] } | RawTransfer[]>(
-    teamBase, `/v1/transfer-requests?workspace_id=${encodeURIComponent(workspaceId)}`, { credentials: "include", headers: teamHeaders(workspaceId) },
+    productBase, `/v1/transfer-requests?workspace_id=${encodeURIComponent(workspaceId)}`, { credentials: "include", headers: workspaceHeaders(workspaceId) },
   )).map(normalizeTransfer),
   resolveTransferRequest: (scope: Scope, requestId: string, decision: "approve" | "reject") => request<RawTransfer>(
-    teamBase, `/v1/transfer-requests/${encodeURIComponent(requestId)}:${decision}`, {
+    productBase, `/v1/transfer-requests/${encodeURIComponent(requestId)}:${decision}`, {
       ...json(decision === "approve" ? {} : { reason: "Workspace 관리자가 이관을 거절했습니다." }),
-      credentials: "include", headers: teamHeaders(scope.workspaceId, scope.projectId),
+      credentials: "include", headers: workspaceHeaders(scope.workspaceId, scope.projectId),
     },
   ).then(normalizeTransfer),
-  dashboard: async (scope: Scope): Promise<TeamDashboard> => {
-    const [members, peerBindings, credentials, projectGrants, workspaceLinks, federatedGrants, transferRequests] = await Promise.all([
-      teamApi.members(scope.workspaceId),
-      teamApi.peerBindings(scope.workspaceId),
-      teamApi.credentials(scope.workspaceId),
-      teamApi.projectGrants(scope),
-      teamApi.workspaceLinks(scope.workspaceId),
-      teamApi.federatedGrants(scope.workspaceId),
-      teamApi.transferRequests(scope.workspaceId),
+  dashboard: async (scope: Scope): Promise<WorkspaceDashboard> => {
+    const [members, peerBindings, credentials, projectGrants, shares, projections, transferRequests] = await Promise.all([
+      workspaceApi.members(scope.workspaceId),
+      workspaceApi.peerBindings(scope.workspaceId),
+      workspaceApi.credentials(scope.workspaceId),
+      workspaceApi.projectGrants(scope),
+      workspaceApi.shares(scope.workspaceId),
+      workspaceApi.projections(scope.workspaceId),
+      workspaceApi.transferRequests(scope.workspaceId),
     ]);
     return {
       members: members.map(member => {
@@ -464,8 +480,8 @@ export const teamApi = {
         human_peer_id: peerBindings.find(item => item.principal_id === credential.principal_id)?.human_peer_id || "",
       })),
       project_grants: projectGrants,
-      workspace_links: workspaceLinks,
-      federated_grants: federatedGrants,
+      shares,
+      projections,
       transfer_requests: transferRequests,
     };
   },
@@ -796,4 +812,4 @@ export async function exchangeManagerBootstrap() {
   return true;
 }
 
-export const apiConfig = { teamBase, get managerBase() { return managerBase; } };
+export const apiConfig = { productBase, get managerBase() { return managerBase; } };

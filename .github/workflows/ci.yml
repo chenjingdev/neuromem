@@ -60,4 +60,4 @@ jobs:
           MCP_TOKEN: ci-mcp-token
           DB_VOLUME_NAME: neuromem-ci-db-g1
           MCP_STATE_VOLUME_NAME: neuromem-ci-mcp
-      - run: docker compose --env-file deploy/team/team.env.example -f deploy/team/compose.yaml config --quiet
+      - run: docker compose --env-file deploy/node/node.env.example -f deploy/node/compose.yaml config --quiet

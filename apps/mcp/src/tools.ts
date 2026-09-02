@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 import { uuid7 } from "./ids.js";
 import { FederatedMemoryRouter } from "./router.js";
-import { TeamGatewayClient } from "./team-gateway-client.js";
+import { ControlGatewayClient } from "./control-gateway-client.js";
 import type { AuthContext, JsonObject, ToolDefinition } from "./types.js";
 
-export type McpAuthMode = "legacy" | "team" | "hybrid";
+export type McpAuthMode = "legacy" | "control" | "hybrid";
 
 export interface MemoryToolDispatcherOptions {
   authMode?: McpAuthMode;
   authContext?: AuthContext;
-  teamGateway?: TeamGatewayClient;
+  controlGateway?: ControlGatewayClient;
   bearerToken?: string;
 }
 
@@ -21,8 +21,8 @@ const uuid7Property = {
 };
 const targetProperty = {
   type: "string",
-  enum: ["personal", "company", "both"],
-  description: "Node alias to use; omitted means the configured default"
+  pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$",
+  description: "Development Router Node ID; use 'all' for every configured Node"
 };
 const scopeProperties = {
   workspace_id: uuidProperty,
@@ -135,7 +135,7 @@ export const MEMORY_TOOLS: readonly ToolDefinition[] = [
   }
 ] as const;
 
-const teamRecallProperties = {
+const controlRecallProperties = {
   query: { type: "string", minLength: 1, maxLength: 10_000 },
   session_id: uuid7Property,
   after: { type: "string", format: "date-time" },
@@ -146,10 +146,10 @@ const teamRecallProperties = {
 };
 
 /**
- * Credential-bound contract used by the team Gateway.  Workspace, Project,
+ * Credential-bound contract used by the Control Gateway. Workspace, Project,
  * Principal, and author Peer are deliberately absent from every schema.
  */
-export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
+export const CONTROL_MEMORY_TOOLS: readonly ToolDefinition[] = [
   {
     name: "memory_record",
     description: "Record a message as the Human or Agent Peer bound to this credential",
@@ -169,7 +169,7 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
   ...["search_records", "search_claims", "recall"].map((name): ToolDefinition => ({
     name,
     description: `${name} within the credential-bound General + current Project context`,
-    inputSchema: { type: "object", additionalProperties: false, properties: teamRecallProperties, required: ["query"] }
+    inputSchema: { type: "object", additionalProperties: false, properties: controlRecallProperties, required: ["query"] }
   })),
   {
     name: "get_record_context", description: "Read neighboring records within the credential scope",
@@ -204,7 +204,7 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
-        query: teamRecallProperties.query, token_budget: { type: "integer", minimum: 256, maximum: 128_000 },
+        query: controlRecallProperties.query, token_budget: { type: "integer", minimum: 256, maximum: 128_000 },
         include_general: { type: "boolean", default: true }, include_federated: { type: "boolean", default: false }
       },
       required: ["query"]
@@ -215,7 +215,7 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
-        query: teamRecallProperties.query, reasoning_level: { type: "string", enum: ["minimal", "low", "medium", "high"] },
+        query: controlRecallProperties.query, reasoning_level: { type: "string", enum: ["minimal", "low", "medium", "high"] },
         include_general: { type: "boolean", default: true }, include_federated: { type: "boolean", default: false }
       }, required: ["query"]
     }
@@ -226,7 +226,7 @@ export const TEAM_MEMORY_TOOLS: readonly ToolDefinition[] = [
   },
   {
     name: "federated_search", description: "Search explicitly granted external Projects with source Workspace, Project, Peer, and grant metadata",
-    inputSchema: { type: "object", additionalProperties: false, properties: { query: teamRecallProperties.query, limit: teamRecallProperties.limit, include_general: { type: "boolean", default: true } }, required: ["query"] }
+    inputSchema: { type: "object", additionalProperties: false, properties: { query: controlRecallProperties.query, limit: controlRecallProperties.limit, include_general: { type: "boolean", default: true } }, required: ["query"] }
   },
   {
     name: "transfer_request", description: "Request an audited transfer of selected records to another Workspace and Project",
@@ -257,15 +257,10 @@ const ALLOWED_KEYS: Record<string, ReadonlySet<string>> = {
   graph_read: new Set(["workspace_id", "project_id", "target"])
 };
 
-const TEAM_ALLOWED_KEYS = Object.fromEntries(TEAM_MEMORY_TOOLS.map((tool) => [
+const CONTROL_ALLOWED_KEYS = Object.fromEntries(CONTROL_MEMORY_TOOLS.map((tool) => [
   tool.name,
   new Set(Object.keys(tool.inputSchema.properties as JsonObject))
 ])) as Record<string, ReadonlySet<string>>;
-
-const TEAM_ONLY_NAMES = new Set([
-  "representation_read", "peer_card_read", "session_context", "dynamic_context",
-  "dialectic_chat", "schedule_dream", "federated_search", "transfer_request"
-]);
 
 const TOOL_CAPABILITY: Record<string, string> = {
   memory_record: "project.write",
@@ -286,7 +281,7 @@ const TOOL_CAPABILITY: Record<string, string> = {
   transfer_request: "transfer.request"
 };
 
-const TEAM_GATEWAY_UNSUPPORTED = new Set(["get_record_context", "get_claim_evidence", "graph_read"]);
+const CONTROL_GATEWAY_UNSUPPORTED = new Set(["get_record_context", "get_claim_evidence", "graph_read"]);
 
 function objectInput(value: unknown): JsonObject {
   if (value === undefined) return {};
@@ -301,8 +296,8 @@ function rejectUnknown(name: string, input: JsonObject): void {
   if (unknown.length > 0) throw new Error(`unknown argument '${unknown[0]}'`);
 }
 
-function rejectUnknownTeam(name: string, input: JsonObject): void {
-  const allowed = TEAM_ALLOWED_KEYS[name];
+function rejectUnknownControl(name: string, input: JsonObject): void {
+  const allowed = CONTROL_ALLOWED_KEYS[name];
   if (!allowed) throw new Error(`unknown memory tool '${name}'`);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) throw new Error(`unknown argument '${unknown[0]}'`);
@@ -389,13 +384,13 @@ function optionalUuid(input: JsonObject, key: string): string | undefined {
   return input[key] === undefined ? undefined : requiredUuid(input, key);
 }
 
-function targetValue(input: JsonObject): "personal" | "company" | "both" | undefined {
+function targetValue(input: JsonObject): string | undefined {
   const target = input.target;
   if (target === undefined) return undefined;
-  if (target !== "personal" && target !== "company" && target !== "both") {
-    throw new Error("target must be 'personal', 'company', or 'both'");
+  if (typeof target !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(target)) {
+    throw new Error("target must be a configured development Router Node ID or 'all'");
   }
-  return target;
+  return target.toLowerCase();
 }
 
 function scope(input: JsonObject): { workspaceId: string; projectId: string } {
@@ -427,17 +422,17 @@ function recallInput(input: JsonObject, router: FederatedMemoryRouter): JsonObje
 export class MemoryToolDispatcher {
   readonly authMode: McpAuthMode;
   readonly authContext?: AuthContext;
-  readonly #teamGateway?: TeamGatewayClient;
+  readonly #controlGateway?: ControlGatewayClient;
   readonly #bearerToken?: string;
 
   constructor(readonly router: FederatedMemoryRouter | undefined, options: MemoryToolDispatcherOptions = {}) {
     this.authMode = options.authMode ?? "hybrid";
     this.authContext = options.authContext;
-    this.#teamGateway = options.teamGateway;
+    this.#controlGateway = options.controlGateway;
     this.#bearerToken = options.bearerToken;
-    if (!(["legacy", "team", "hybrid"] as string[]).includes(this.authMode)) throw new Error("authMode must be legacy, team, or hybrid");
-    if (this.#teamGateway && (!this.authContext || !this.#bearerToken)) throw new Error("team Gateway requests require AuthContext and a transient bearer");
-    if (!this.router && !this.#teamGateway && this.authMode !== "team") throw new Error("legacy and hybrid modes require a memory router");
+    if (!(["legacy", "control", "hybrid"] as string[]).includes(this.authMode)) throw new Error("authMode must be legacy, control, or hybrid");
+    if (this.#controlGateway && (!this.authContext || !this.#bearerToken)) throw new Error("Control Gateway requests require AuthContext and a transient bearer");
+    if (!this.router && !this.#controlGateway && this.authMode !== "control") throw new Error("legacy and hybrid development modes require a memory router");
     if (this.authContext) {
       for (const key of ["principal_id", "credential_id", "workspace_id", "project_id", "human_peer_id"] as const) {
         if (!this.authContext[key]) throw new Error(`AuthContext.${key} is required`);
@@ -446,35 +441,31 @@ export class MemoryToolDispatcher {
     }
   }
 
-  withAuthContext(authContext: AuthContext, authMode: McpAuthMode = "team"): MemoryToolDispatcher {
+  withAuthContext(authContext: AuthContext, authMode: McpAuthMode = "control"): MemoryToolDispatcher {
     return new MemoryToolDispatcher(this.router, { authContext, authMode });
   }
 
-  withTeamRequest(authContext: AuthContext, gateway: TeamGatewayClient, bearerToken: string): MemoryToolDispatcher {
-    return new MemoryToolDispatcher(undefined, { authContext, authMode: "team", teamGateway: gateway, bearerToken });
+  withControlRequest(authContext: AuthContext, gateway: ControlGatewayClient, bearerToken: string): MemoryToolDispatcher {
+    return new MemoryToolDispatcher(undefined, { authContext, authMode: "control", controlGateway: gateway, bearerToken });
   }
 
   listTools(): ToolDefinition[] {
     let tools: readonly ToolDefinition[];
     if (this.authMode === "legacy" || !this.authContext) {
       tools = MEMORY_TOOLS;
-    } else if (this.authMode === "team") {
-      tools = TEAM_MEMORY_TOOLS.filter((tool) => (!this.#teamGateway || !TEAM_GATEWAY_UNSUPPORTED.has(tool.name)) && this.#hasCapability(TOOL_CAPABILITY[tool.name]!));
+    } else if (this.authMode === "control") {
+      tools = CONTROL_MEMORY_TOOLS.filter((tool) => (!this.#controlGateway || !CONTROL_GATEWAY_UNSUPPORTED.has(tool.name)) && this.#hasCapability(TOOL_CAPABILITY[tool.name]!));
     } else {
-      tools = [
-        ...MEMORY_TOOLS.filter((tool) => this.#hasCapability(TOOL_CAPABILITY[tool.name]!)),
-        ...TEAM_MEMORY_TOOLS.filter((tool) => TEAM_ONLY_NAMES.has(tool.name) && this.#hasCapability(TOOL_CAPABILITY[tool.name]!))
-      ];
+      tools = MEMORY_TOOLS.filter((tool) => this.#hasCapability(TOOL_CAPABILITY[tool.name]!));
     }
     return tools.map((tool) => ({ ...tool, inputSchema: { ...tool.inputSchema } }));
   }
 
   async callTool(name: string, argumentsValue?: unknown): Promise<unknown> {
     const input = objectInput(argumentsValue);
-    if (this.authMode === "team") return this.#callTeam(name, input);
+    if (this.authMode === "control") return this.#callControl(name, input);
     if (this.authMode === "hybrid" && this.authContext) {
       this.#requireCapability(name);
-      if (TEAM_ONLY_NAMES.has(name)) return this.#callTeam(name, input);
       this.#assertLegacyScopeAndPeer(input, name);
     }
     return this.#callLegacy(name, input);
@@ -521,17 +512,17 @@ export class MemoryToolDispatcher {
     }
   }
 
-  async #callTeam(name: string, input: JsonObject): Promise<unknown> {
+  async #callControl(name: string, input: JsonObject): Promise<unknown> {
     if (!this.authContext) throw new Error("credential-bound AuthContext is required");
-    rejectUnknownTeam(name, input);
+    rejectUnknownControl(name, input);
     this.#requireCapability(name);
-    const gateway = this.#teamGateway;
+    const gateway = this.#controlGateway;
     const bearer = this.#bearerToken;
-    if (!gateway || !bearer) throw new Error("team mode requires the Control Gateway and an incoming bearer credential");
-    return this.#callTeamGateway(gateway, bearer, name, input);
+    if (!gateway || !bearer) throw new Error("control auth requires the Control Gateway and an incoming bearer credential");
+    return this.#callControlGateway(gateway, bearer, name, input);
   }
 
-  async #callTeamGateway(gateway: TeamGatewayClient, bearer: string, name: string, input: JsonObject): Promise<unknown> {
+  async #callControlGateway(gateway: ControlGatewayClient, bearer: string, name: string, input: JsonObject): Promise<unknown> {
     const context = this.authContext!;
     const workspaceId = context.workspace_id;
     const projectId = context.project_id;
@@ -651,7 +642,7 @@ export class MemoryToolDispatcher {
         } });
       }
       default:
-        if (TEAM_GATEWAY_UNSUPPORTED.has(name)) throw new Error(`team Gateway does not support '${name}'`);
+        if (CONTROL_GATEWAY_UNSUPPORTED.has(name)) throw new Error(`Control Gateway does not support '${name}'`);
         throw new Error(`unknown memory tool '${name}'`);
     }
   }

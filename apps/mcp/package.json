@@ -2,7 +2,7 @@
   "name": "@neuromem/mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Federated memory MCP adapter and node router",
+  "description": "Neuromem Control Gateway MCP adapter with a development node router",
   "type": "module",
   "engines": {
     "node": ">=20"

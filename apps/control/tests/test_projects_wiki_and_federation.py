@@ -314,11 +314,18 @@ def test_transfer_has_two_approval_stages_and_import_completion(client, bootstra
 def test_openapi_exposes_team_contract_routes(client):
     paths = client.get("/openapi.json").json()["paths"]
     expected = {
+        "/api/v1/node",
         "/api/v1/workspaces/{workspace_id}/members",
+        "/api/v1/workspaces/{workspace_id}:select",
         "/api/v1/workspaces/{workspace_id}/peer-bindings",
         "/api/v1/credentials",
         "/api/v1/projects/{project_id}/grants",
         "/api/v1/workspace-links",
+        "/api/v1/workspace-shares",
+        "/api/v1/workspace-shares/{share_id}:approve",
+        "/api/v1/workspace-shares/{share_id}:reject",
+        "/api/v1/workspace-shares/{share_id}:revoke",
+        "/api/v1/workspace-projections",
         "/api/v1/federated-project-grants",
         "/api/v1/transfer-requests",
         "/api/v1/transfer-requests/{transfer_id}:approve",

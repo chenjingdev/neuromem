@@ -1,27 +1,35 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import crypto from "node:crypto";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdminAuth } from "./auth.js";
 import { exists } from "./fs-safe.js";
+import { FolderSourceError, FolderSourceManager, type ProjectFolderContext } from "./folder-sources.js";
+import { InternalAuthorizationError, verifyControlInternalAuthorization } from "./internal-auth.js";
 import { managerOpenApi } from "./openapi.js";
 import type { ManagerPaths } from "./paths.js";
+import { ProcessRunner } from "./process-runner.js";
 import type { NodeManager } from "./node-manager.js";
+import { readPrivateEnv, type NodeDeploymentManager } from "./node-deployment-manager.js";
 
 type Transport = "tcp" | "unix";
 
 export interface AdminServerOptions {
   manager: NodeManager;
+  deployment?: NodeDeploymentManager;
   paths: ManagerPaths;
   port?: number;
   webDist?: string;
+  folderSources?: FolderSourceManager;
 }
 
 export class AdminServer {
   readonly port: number;
   readonly auth: AdminAuth;
   readonly webDist: string;
+  readonly folderSources: FolderSourceManager;
   #tcp: http.Server | null = null;
   #unix: http.Server | null = null;
   #reconcileTimer: NodeJS.Timeout | null = null;
@@ -35,6 +43,7 @@ export class AdminServer {
     const packaged = fileURLToPath(new URL("../../assets/admin-dist", import.meta.url));
     const fallback = fileURLToPath(new URL("../../assets/admin", import.meta.url));
     this.webDist = path.resolve(options.webDist || process.env.NEUROMEM_WEB_DIST || (fsSync.existsSync(path.join(packaged, "index.html")) ? packaged : fallback));
+    this.folderSources = options.folderSources || new FolderSourceManager({ paths: options.paths, runner: new ProcessRunner() });
   }
 
   async start(): Promise<void> {
@@ -66,7 +75,7 @@ export class AdminServer {
     if (this.#reconcileTimer) clearInterval(this.#reconcileTimer);
     this.#reconcileTimer = null;
     await Promise.all([close(this.#tcp), close(this.#unix)]);
-    await this.options.manager.close();
+    await Promise.all([this.options.manager.close(), this.options.deployment?.close()]);
     this.#tcp = null;
     this.#unix = null;
     if (this.#socketOwned) await fs.rm(this.options.paths.socket, { force: true });
@@ -94,16 +103,29 @@ export class AdminServer {
       const codexBridge = match(url.pathname, /^\/v1\/internal\/codex\/nodes\/([^/]+)\/(models|chat\/completions)$/);
       if (codexBridge && ((codexBridge[2] === "models" && request.method === "GET") || (codexBridge[2] === "chat/completions" && request.method === "POST"))) {
         try {
+          const deploymentId = await this.deploymentNodeId();
+          const useDeployment = Boolean(this.options.deployment && deploymentId === codexBridge[1]);
+          if (this.options.deployment && !useDeployment) throw new Error("Unknown Node");
           const value = codexBridge[2] === "models"
-            ? await this.options.manager.codexBridgeModels(codexBridge[1]!, request.headers.authorization)
-            : await this.options.manager.codexChatCompletion(codexBridge[1]!, request.headers.authorization, await readBody(request));
+            ? useDeployment
+              ? await this.options.deployment!.codexBridgeModels(codexBridge[1]!, request.headers.authorization)
+              : await this.options.manager.codexBridgeModels(codexBridge[1]!, request.headers.authorization)
+            : useDeployment
+              ? await this.options.deployment!.codexChatCompletion(codexBridge[1]!, request.headers.authorization, await readBody(request))
+              : await this.options.manager.codexChatCompletion(codexBridge[1]!, request.headers.authorization, await readBody(request));
           return sendJson(response, 200, value);
         } catch (error) {
           const message = String((error as Error).message || "");
           if (/authorization/i.test(message)) return sendOpenAiError(response, 401, "Invalid Node bridge authorization", "invalid_request_error");
+          if (/unknown node/i.test(message)) return sendOpenAiError(response, 404, "Unknown Node", "invalid_request_error");
           if (/invalid|unsupported|does not match/i.test(message)) return sendOpenAiError(response, 400, "Invalid Codex generation request", "invalid_request_error");
           return sendOpenAiError(response, 503, "Codex generation is temporarily unavailable", "provider_unavailable");
         }
+      }
+      const folderSourceRoute = match(url.pathname, /^\/v1\/internal\/nodes\/([^/]+)\/(folder-sources:pick|folder-sources:detach)$/);
+      if (folderSourceRoute && request.method === "POST") {
+        if (transport !== "tcp") return sendError(response, 404, "Not found");
+        return this.handleInternalFolderSource(request, response, folderSourceRoute[1]!, folderSourceRoute[2]!);
       }
       if (url.pathname === "/v1/admin/session" && request.method === "POST" && transport === "tcp") {
         if (!request.headers.origin) return sendError(response, 403, "A same-origin browser request is required");
@@ -114,7 +136,14 @@ export class AdminServer {
         response.setHeader("set-cookie", `neuromem_admin=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`);
         return sendJson(response, 200, { ok: true });
       }
-      if (url.pathname.startsWith("/admin") && request.method === "GET") {
+      if (url.pathname === "/admin" && request.method === "GET") {
+        response.statusCode = 308;
+        response.setHeader("location", `/admin/${url.search}`);
+        response.setHeader("cache-control", "no-store");
+        response.end();
+        return;
+      }
+      if (url.pathname.startsWith("/admin/") && request.method === "GET") {
         return this.serveAdmin(url.pathname, response);
       }
       if (transport === "tcp") {
@@ -127,24 +156,28 @@ export class AdminServer {
       if (url.pathname === "/v1/admin/bootstrap" && request.method === "POST") {
         if (transport !== "unix") return sendError(response, 404, "Not found");
         const body = await readBody<{ node_id?: string }>(request);
-        const node = body.node_id ? await this.options.manager.store.findNode(body.node_id) : await this.options.manager.store.defaultNode();
-        const token = await this.auth.issueBootstrap(node?.node_id);
+        const deploymentId = await this.deploymentNodeId();
+        const node = deploymentId ? null : body.node_id ? await this.options.manager.store.findNode(body.node_id) : await this.options.manager.store.defaultNode();
+        const token = await this.auth.issueBootstrap(deploymentId || node?.node_id);
         const dashboard = `http://127.0.0.1:${this.port}/admin/#neuromem-admin=${encodeURIComponent(token)}`;
         return sendJson(response, 200, { ok: true, token, url: dashboard, expires_in_seconds: 60 });
       }
       if (url.pathname === "/v1/cli/nodes" && request.method === "POST") {
         if (transport !== "unix") return sendError(response, 404, "Not found");
+        if (this.options.deployment) return sendError(response, 404, "The physical Node is configured with `neuromem node config init`");
         return sendJson(response, 200, await this.options.manager.createNode(await readBody(request)));
       }
       const cliDelete = match(url.pathname, /^\/v1\/cli\/nodes\/([^/]+)$/);
       if (cliDelete && request.method === "DELETE") {
         if (transport !== "unix") return sendError(response, 404, "Not found");
+        if (this.options.deployment) return sendError(response, 404, "The physical Node cannot be deleted through the legacy Node API");
         const body = await readBody<{ confirmation: string; purge_data?: boolean }>(request);
         return sendJson(response, 200, await this.options.manager.deleteNode(cliDelete[1]!, body.confirmation, Boolean(body.purge_data)));
       }
       const cliApply = match(url.pathname, /^\/v1\/cli\/nodes\/([^/]+)\/(restore\/apply|migrate\/apply|migrate\/verify)$/);
       if (cliApply && request.method === "POST") {
         if (transport !== "unix") return sendError(response, 404, "Not found");
+        if (this.options.deployment) return sendError(response, 404, "This operation is not available for the physical Node");
         const body = await readBody<{ backup_id?: string; target_revision?: string; confirmation?: string; apply_mode?: string }>(request);
         if (cliApply[2] === "restore/apply") {
           if (!body.backup_id || !body.confirmation) return sendError(response, 400, "backup_id and confirmation are required");
@@ -159,26 +192,57 @@ export class AdminServer {
       const modelConfigure = match(url.pathname, /^\/v1\/cli\/nodes\/([^/]+)\/models\/configure$/);
       if (modelConfigure && request.method === "POST") {
         if (transport !== "unix") return sendError(response, 404, "Not found");
+        if (this.options.deployment) return sendError(response, 404, "Use the physical Node model selection API");
         return sendJson(response, 200, await this.options.manager.configureModels(modelConfigure[1]!, await readBody(request)));
       }
       if (url.pathname === "/v1/nodes" && request.method === "GET") {
+        if (this.options.deployment) {
+          if (!(await this.deploymentNodeId())) return sendJson(response, 200, { nodes: [], default_node_id: null });
+          const status = await this.options.deployment!.adminStatus();
+          return sendJson(response, 200, { nodes: [status.node], default_node_id: status.node.node_id });
+        }
         const registry = await this.options.manager.store.registry();
         return sendJson(response, 200, { nodes: registry.nodes, default_node_id: registry.default_node_id });
       }
       const modelSelection = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/models$/);
       if (modelSelection && request.method === "GET") {
+        if (await this.isDeploymentNode(modelSelection[1]!)) return sendJson(response, 200, await this.options.deployment!.modelSelection());
+        if (this.options.deployment) return sendError(response, 404, "Node not found");
         return sendJson(response, 200, await this.options.manager.modelSelection(modelSelection[1]!));
       }
       if (modelSelection && request.method === "POST") {
+        if (await this.isDeploymentNode(modelSelection[1]!)) return sendJson(response, 200, await this.options.deployment!.selectModels(await readBody(request)));
+        if (this.options.deployment) return sendError(response, 404, "Node not found");
         return sendJson(response, 200, await this.options.manager.selectModels(modelSelection[1]!, await readBody(request)));
       }
       const generationProbe = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/generation\/probe$/);
       if (generationProbe && request.method === "POST") {
+        if (await this.isDeploymentNode(generationProbe[1]!)) return sendJson(response, 200, await this.options.deployment!.generationProbe(await readBody(request)));
+        if (this.options.deployment) return sendError(response, 404, "Node not found");
         return sendJson(response, 200, await this.options.manager.generationProbe(generationProbe[1]!, await readBody(request)));
       }
       const route = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/(health|backlog|logs|start|stop|restart|backups)$/);
       if (route) {
         const [, selector, action] = route;
+        if (await this.isDeploymentNode(selector!)) {
+          if (action === "health" && request.method === "GET") return sendJson(response, 200, await this.options.deployment!.adminStatus());
+          if (action === "backlog" && request.method === "GET") return sendJson(response, 200, { node_id: selector, available: false, pending: 0, running: 0, failed: 0 });
+          if (action === "logs" && request.method === "GET") {
+            const tail = Number(url.searchParams.get("tail") || "200");
+            const requestedService = url.searchParams.get("service") || "control";
+            const service = requestedService === "api" ? "control" : requestedService;
+            return sendJson(response, 200, { logs: await this.options.deployment!.logs(undefined, service, tail) });
+          }
+          if (["start", "stop", "restart"].includes(action!) && request.method === "POST") {
+            return sendJson(response, 200, await this.options.deployment!.adminOperation(action as "start" | "stop" | "restart"));
+          }
+          if (action === "backups" && request.method === "GET") return sendJson(response, 200, { backups: [] });
+          if (action === "backups" && request.method === "POST") {
+            const result = await this.options.deployment!.backupRehearsal();
+            return sendJson(response, 200, deploymentOperation(selector!, "backup", "verified", result));
+          }
+        }
+        if (this.options.deployment) return sendError(response, 404, "Node not found");
         if (action === "health" && request.method === "GET") return sendJson(response, 200, await this.options.manager.status(selector!));
         if (action === "backlog" && request.method === "GET") return sendJson(response, 200, await this.options.manager.backlog(selector!));
         if (action === "logs" && request.method === "GET") {
@@ -196,10 +260,12 @@ export class AdminServer {
       }
       const backupVerify = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/backups\/([^/]+)\/verify$/);
       if (backupVerify && request.method === "POST") {
+        if (this.options.deployment) return sendError(response, 404, "This operation is not available for the physical Node");
         return sendJson(response, 200, await this.options.manager.backupVerify(backupVerify[1]!, backupVerify[2]!));
       }
       const plan = match(url.pathname, /^\/v1\/nodes\/([^/]+)\/(restore|migrate)\/plan$/);
       if (plan && request.method === "POST") {
+        if (this.options.deployment) return sendError(response, 404, "This operation is not available for the physical Node");
         const body = await readBody<{ backup_id?: string; target_revision?: string; apply_mode?: string }>(request);
         if (plan[2] === "restore") {
           if (!body.backup_id) return sendError(response, 400, "backup_id is required");
@@ -226,6 +292,61 @@ export class AdminServer {
       response.setHeader("vary", "Origin");
     }
     return allowed;
+  }
+
+  private async handleInternalFolderSource(
+    request: IncomingMessage,
+    response: ServerResponse,
+    nodeSelector: string,
+    action: string,
+  ): Promise<void> {
+    try {
+      if (request.headers.origin) return sendError(response, 403, "Browser origins cannot call internal routes");
+      const deployment = this.options.deployment;
+      if (!deployment) return sendError(response, 404, "Node not found");
+      const target = deployment.envPath();
+      if (!(await exists(target))) return sendError(response, 404, "Node not found");
+      const env = await readPrivateEnv(target);
+      const configuredNodeId = env.NEUROMEM_NODE_ID;
+      const signingKey = env.CONTROL_INTERNAL_SIGNING_KEY;
+      if (!configuredNodeId || nodeSelector !== configuredNodeId) return sendError(response, 404, "Node not found");
+      if (!signingKey || Buffer.byteLength(signingKey, "utf8") < 32) return sendError(response, 503, "Internal authorization is not configured");
+      const context = verifyControlInternalAuthorization(request.headers.authorization, signingKey);
+      if (!context.capabilities.includes("project.write")) return sendError(response, 403, "Project write capability is required");
+      const folderContext: ProjectFolderContext = {
+        principal_id: context.principal_id,
+        workspace_id: context.workspace_id,
+        project_id: context.project_id,
+      };
+      if (action === "folder-sources:pick") {
+        return sendJson(response, 200, await this.folderSources.pick(folderContext));
+      }
+      const body = await readBody<{ source_id?: string }>(request);
+      if (typeof body.source_id !== "string") return sendError(response, 400, "source_id is required");
+      await this.folderSources.detach(folderContext, body.source_id);
+      return sendJson(response, 200, { ok: true });
+    } catch (error) {
+      if (error instanceof InternalAuthorizationError) return sendError(response, 401, "Invalid internal authorization");
+      if (error instanceof FolderSourceError) return sendError(response, error.status, error.message);
+      return sendError(response, 503, "The local folder source service is unavailable");
+    }
+  }
+
+  private async deploymentNodeId(): Promise<string | null> {
+    const deployment = this.options.deployment;
+    if (!deployment) return null;
+    const target = deployment.envPath();
+    if (!(await exists(target))) return null;
+    try {
+      const env = await readPrivateEnv(target);
+      return env.NEUROMEM_NODE_ID || "local";
+    } catch {
+      return null;
+    }
+  }
+
+  private async isDeploymentNode(selector: string): Promise<boolean> {
+    return Boolean(this.options.deployment && selector === await this.deploymentNodeId());
   }
 
   private async serveAdmin(requestPath: string, response: ServerResponse): Promise<void> {
@@ -256,6 +377,7 @@ export class AdminServer {
 
   private async triggerReconcile(): Promise<void> {
     if (this.#reconciling) return;
+    if (await this.deploymentNodeId()) return;
     this.#reconciling = true;
     try {
       await this.options.manager.reconcileDesiredNodes();
@@ -296,6 +418,21 @@ export class AdminServer {
 function processAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function deploymentOperation(nodeId: string, kind: string, phase: string, result?: unknown): Record<string, unknown> {
+  const now = new Date().toISOString();
+  return {
+    operation_id: crypto.randomUUID(),
+    node_id: nodeId,
+    kind,
+    state: "succeeded",
+    phase,
+    started_at: now,
+    updated_at: now,
+    completed_at: now,
+    result,
+  };
 }
 
 async function readBody<T = Record<string, unknown>>(request: IncomingMessage): Promise<T> {

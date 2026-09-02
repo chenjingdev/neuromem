@@ -241,7 +241,7 @@ export class FederatedMemoryRouter {
       node.id,
       new CoreClient(node, config.requestTimeoutMs ?? 120_000, config.maxCoreResponseBytes ?? 64 * 1_048_576)
     ]));
-    const fallback = this.#nodes.has("personal") ? ["personal"] : [config.nodes[0]!.id];
+    const fallback = [config.nodes[0]!.id];
     this.#defaultReadTargets = config.defaultReadTargets ?? fallback;
     this.#defaultWriteTargets = config.defaultWriteTargets ?? fallback;
     this.#queue = new DurableRetryQueue(config.stateDir);
@@ -260,9 +260,9 @@ export class FederatedMemoryRouter {
     await this.#ready;
   }
 
-  targetsFor(target: "personal" | "company" | "both" | undefined): string[] | undefined {
+  targetsFor(target: string | undefined): string[] | undefined {
     if (target === undefined) return undefined;
-    const requested = target === "both" ? ["personal", "company"] : [target];
+    const requested = target === "all" ? [...this.#nodes.keys()] : [target];
     const missing = requested.filter((nodeId) => !this.#nodes.has(nodeId));
     if (missing.length > 0) {
       throw new Error(`target '${target}' is unavailable; missing node '${missing[0]}'`);

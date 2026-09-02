@@ -18,6 +18,7 @@ def client(tmp_path, monkeypatch):
         "NEUROMEM_CONTROL_SECRET_KEY",
         "test-control-secret-0123456789abcdef0123456789abcdef",
     )
+    monkeypatch.setenv("NEUROMEM_CONTROL_NODE_ID", "test-physical-node")
     monkeypatch.setenv("NEUROMEM_CONTROL_AUTO_CREATE_SCHEMA", "true")
     monkeypatch.setenv("NEUROMEM_CONTROL_SECURE_COOKIES", "false")
     get_settings.cache_clear()

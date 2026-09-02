@@ -12,7 +12,14 @@
   },
   "files": [
     "dist/src",
-    "assets",
+    "assets/admin",
+    "assets/admin-dist",
+    "assets/build-manifest.json",
+    "assets/images/control",
+    "assets/images/mcp",
+    "assets/images/web",
+    "assets/node",
+    "assets/skill",
     "README.md"
   ],
   "scripts": {

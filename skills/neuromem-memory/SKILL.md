@@ -1,6 +1,6 @@
 ---
 name: neuromem-memory
-description: Record and recall source-grounded project memory through Neuromem MCP, especially when an agent must recover prior decisions, facts, evidence, Wiki context, or relationships without a memory-side chat model.
+description: Record and recall source-grounded memory through Neuromem MCP within the Workspace and Project bound to the current credential, with optional read-only recall from Projects exposed by approved WorkspaceShares.
 ---
 
 # Neuromem Memory
@@ -9,20 +9,23 @@ Use Neuromem as an evidence store, not as an answer generator. The calling agent
 
 ## Recall
 
-- Use the Workspace and Project scope supplied by the current project profile. Do not guess UUIDs or silently switch scope.
+- Use only the Workspace, Project, Principal, and Peer identities bound to the current credential. Do not supply guessed UUIDs, imitate another author, or silently switch scope.
 - Start with `recall` for an ordinary memory question. Use `search_records` for exact wording or raw events and `search_claims` for compact assertions.
 - When a Claim affects the answer, call `get_claim_evidence`. Use `get_record_context` when the surrounding exchange can change its meaning.
 - Use `wiki_read` for a project-level current view and `graph_read` only when relationships matter.
-- Treat a Claim as an assertion derived from a Record, not as unquestionable truth. Preserve `origin_node`, surface conflicts, and cite the supporting Record IDs.
+- Keep `include_federated=false` for normal recall. Set `include_federated=true`, or use `federated_search`, only when the request needs external memory exposed to the current Workspace by an active WorkspaceShare approved by both Workspace owners.
+- Treat an external Workspace or Project displayed in the management UI as a read-only projection, not as copied memory or permission to write there. Preserve its source Workspace, Project, WorkspaceShare, and Record identifiers in the answer.
+- Treat a Claim as an assertion derived from a Record, not as unquestionable truth. Surface conflicts and cite the supporting Record IDs.
 - If evidence is insufficient, say what is missing. Do not fill the gap with background knowledge and present it as remembered fact.
 
-For a broad or ambiguous recall task, delegate the searches to a subagent when the host supports subagents. Ask it to return a compact evidence packet—relevant Claims, Record IDs, origin Nodes, conflicts, and unresolved gaps—so raw search results do not fill the main context.
+For a broad or ambiguous recall task, delegate the searches to a subagent when the host supports subagents. Ask it to return a compact evidence packet—relevant Claims, Record IDs, source Workspaces and Projects, conflicts, and unresolved gaps—so raw search results do not fill the main context.
 
 ## Record
 
 - Call `memory_record` once per source event with the actual human or Agent author. Do not relabel an Agent statement as a user statement.
 - Supply a stable `idempotency_key` derived from the source session and event/message ID. Reuse it when retrying an ambiguous call.
 - Exclude system prompts, scheduler output, and automation noise. Record tool output only when it was intentionally submitted as a `tool_result` Record.
-- Keep Personal and Company routing explicit. Use `target: both` only when the configured Router has valid scope mappings for both Nodes.
+- Record only to the Project bound to the current credential. Do not add Workspace, Project, Principal, or author routing fields that the credential-bound tool schema intentionally omits.
+- Use `transfer_request` for an audited request to move selected records into another Workspace and Project. A WorkspaceShare grants recall access; it does not grant direct write access.
 
 Do not look for or emulate a memory-side `chat()` tool. Synthesize the answer from the bounded structured results and their evidence.

@@ -33,12 +33,12 @@ export interface McpAuthConfig {
 }
 
 export function loadMcpAuthConfig(env: Environment = process.env): McpAuthConfig {
-  const mode = (env.NEUROMEM_MCP_AUTH_MODE || (env.NEUROMEM_MCP_AUTH_CONTEXT || env.NEUROMEM_CONTROL_API_URL ? "team" : "hybrid")).toLowerCase();
-  if (mode !== "legacy" && mode !== "team" && mode !== "hybrid") {
-    throw new Error("NEUROMEM_MCP_AUTH_MODE must be legacy, team, or hybrid");
+  const mode = (env.NEUROMEM_MCP_AUTH_MODE || (env.NEUROMEM_MCP_AUTH_CONTEXT || env.NEUROMEM_CONTROL_API_URL ? "control" : "hybrid")).toLowerCase();
+  if (mode !== "legacy" && mode !== "control" && mode !== "hybrid") {
+    throw new Error("NEUROMEM_MCP_AUTH_MODE must be legacy, control, or hybrid");
   }
   if (!env.NEUROMEM_MCP_AUTH_CONTEXT) {
-    if (mode === "team" && !env.NEUROMEM_CONTROL_API_URL) throw new Error("team auth mode requires NEUROMEM_MCP_AUTH_CONTEXT or NEUROMEM_CONTROL_API_URL");
+    if (mode === "control" && !env.NEUROMEM_CONTROL_API_URL) throw new Error("control auth requires NEUROMEM_MCP_AUTH_CONTEXT or NEUROMEM_CONTROL_API_URL");
     return { mode };
   }
   let decoded: unknown;
@@ -135,17 +135,6 @@ function normalizeNode(raw: RawNodeConfig): CoreNodeConfig {
   };
 }
 
-function fallbackNodes(env: Environment): RawNodeConfig[] {
-  const nodes: RawNodeConfig[] = [];
-  if (env.NEUROMEM_PERSONAL_URL) {
-    nodes.push({ id: "personal", base_url: env.NEUROMEM_PERSONAL_URL, token: env.NEUROMEM_PERSONAL_TOKEN });
-  }
-  if (env.NEUROMEM_COMPANY_URL) {
-    nodes.push({ id: "company", base_url: env.NEUROMEM_COMPANY_URL, token: env.NEUROMEM_COMPANY_TOKEN });
-  }
-  return nodes;
-}
-
 export function loadRouterConfig(env: Environment = process.env): RouterConfig {
   let raw: RawRouterConfig = {};
   let rawNodes: RawNodeConfig[] = [];
@@ -175,8 +164,6 @@ export function loadRouterConfig(env: Environment = process.env): RouterConfig {
     } else {
       throw new Error("NEUROMEM_NODES_JSON must be a node array or a router object");
     }
-  } else {
-    rawNodes = fallbackNodes(env);
   }
 
   const nodes = rawNodes.map(normalizeNode);
@@ -185,7 +172,7 @@ export function loadRouterConfig(env: Environment = process.env): RouterConfig {
     throw new Error("node ids must be unique");
   }
 
-  const preferredDefault = nodes.some((node) => node.id === "personal") ? ["personal"] : [nodes[0]!.id];
+  const preferredDefault = [nodes[0]!.id];
   const defaultReadTargets = parseTargetList(env.NEUROMEM_DEFAULT_READ_TARGETS ?? raw.default_read_targets) ?? preferredDefault;
   const defaultWriteTargets = parseTargetList(env.NEUROMEM_DEFAULT_WRITE_TARGETS ?? raw.default_write_targets) ?? preferredDefault;
   const known = new Set(nodes.map((node) => node.id));
